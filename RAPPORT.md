@@ -119,6 +119,8 @@ Au départ, les trois drones étaient créés dynamiquement par PX4 à chaque la
 
 ## Tester soi-même
 
+**Raccourci :** `~/Documents/my_project/gazebo_swarm/launch_all.sh` fait tout d'un coup — compile `swarm_node` si besoin, ouvre la fenêtre Gazebo/PX4, attend qu'elle soit prête, puis ouvre les 3 fenêtres `swarm_node`. Le détail étape par étape ci-dessous reste utile pour comprendre ce qui se passe, ou dépanner si quelque chose coince.
+
 Ouvrir 4 fenêtres de terminal.
 
 Dans la première, lancer `~/Documents/my_project/gazebo_swarm/run_swarm.sh` et attendre que Gazebo s'ouvre avec les trois drones posés au sol. Le bouton "reset" de Gazebo peut être testé à ce stade : les drones doivent rester en place.

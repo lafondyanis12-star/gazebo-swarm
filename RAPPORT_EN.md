@@ -119,6 +119,8 @@ At first, the three drones were spawned dynamically by PX4 on every launch — n
 
 ## Testing it yourself
 
+**Shortcut:** `~/Documents/my_project/gazebo_swarm/launch_all.sh` does all of this in one go — builds `swarm_node` if needed, opens the Gazebo/PX4 window, waits for it to be ready, then opens the 3 `swarm_node` windows. The step-by-step breakdown below is still useful for understanding what's happening, or troubleshooting if something gets stuck.
+
 Open 4 terminal windows.
 
 In the first, run `~/Documents/my_project/gazebo_swarm/run_swarm.sh` and wait for Gazebo to open with the three drones sitting on the ground. The Gazebo "reset" button can be tried at this point — the drones should stay put.
