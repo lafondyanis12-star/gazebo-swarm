@@ -2,7 +2,7 @@
 
 Drone swarm communication and leader election, built on Gazebo Sim + PX4 SITL (the simulator recommended for this internship, after an initial Webots prototype — see the report). Three simulated drones detect each other, notice when one drops off (either by process failure or by going out of radio range), and elect a new leader automatically.
 
-📄 Full write-up: [`RAPPORT.md`](./RAPPORT.md) 🇫🇷 · [`RAPPORT_EN.md`](./RAPPORT_EN.md) 🇬🇧 — the research process, the problems hit along the way and how they got fixed.
+📄 Full write-up: [`RAPPORT_EN.md`](./RAPPORT_EN.md) — the research process, the problems hit along the way and how they got fixed.
 
 ## 🗺️ Where things stand
 
@@ -20,6 +20,7 @@ Drone swarm communication and leader election, built on Gazebo Sim + PX4 SITL (t
 
 ## 📁 Files
 
+- `launch_all.sh` — builds if needed and opens all 4 terminal windows automatically (the fastest way to run everything).
 - `run_swarm.sh` — starts the 3 PX4 SITL instances in the persistent world.
 - `swarm_node.cpp` / `CMakeLists.txt` — communication, disconnection detection, leader election (`./build/swarm_node --id 0|1|2`).
 - `worlds/swarm_persistent.sdf` — the Gazebo world with the 3 drones already placed in it.

@@ -1,6 +1,6 @@
 # Report — Communication and Leader Election for a Drone Swarm (Gazebo + PX4)
 
-This report walks through the work, roughly in the order it happened, of setting up communication and leader election for a drone swarm under Gazebo and PX4. French version in `RAPPORT.md`.
+This report walks through the work, roughly in the order it happened, of setting up communication and leader election for a drone swarm under Gazebo and PX4.
 
 ## Context
 
