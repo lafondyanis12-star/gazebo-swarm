@@ -52,9 +52,9 @@ With those three sorted out, `make px4_sitl` builds cleanly and produces the bin
 
 **Planned:** each drone reads its real position, shares it with the other two, detects a disconnection (3s timeout, matching Webots), and elects a new leader when the leader disappears.
 
-The design comes down to two pieces. First, each drone connects via MAVSDK to its own PX4 instance and reads its real GPS position, computed by Gazebo's physics. Second, each drone broadcasts that position to the other two, five times a second, over a small UDP mesh built for this — the direct equivalent of Webots' `emitter`/`receiver`. Each drone keeps track of when it last heard from each other drone; past 3 seconds of silence (matching the Webots threshold), it's marked as disconnected.
+The design comes down to two pieces, run concurrently as three `std::thread`s per drone (one to broadcast, one to receive, one to check timeouts and run the election). First, each drone connects via MAVSDK's `Telemetry` plugin to its own PX4 instance and reads its real GPS position, computed by Gazebo's physics. Second, each drone broadcasts that position to the other two, five times a second, over a small UDP mesh built directly with POSIX sockets (`socket`/`bind`/`sendto`/`recvfrom`) — the direct equivalent of Webots' `emitter`/`receiver`. Each drone keeps track of when it last heard from each other drone; past 3 seconds of silence (matching the Webots threshold), it's marked as disconnected.
 
-The election follows a simple rule each drone applies on its own, with no coordination: the leader should always be the lowest surviving ID among the ones it can see. Since all three drones see roughly the same network, they all land on the same answer.
+The election follows a simple rule each drone applies on its own, with no coordination: the leader should always be the lowest surviving ID among the ones it can see. This rule is recomputed every 500ms by the timeout-checking thread, not just when a disconnection happens (see the split-brain fix below for why that distinction matters). Since all three drones see roughly the same network, they all land on the same answer.
 
 ### The custom protocol's wire format
 
@@ -103,7 +103,7 @@ At first, the three drones were spawned dynamically by PX4 on every launch — n
 
 **Planned:** be able to test a disconnection by physically moving a drone away, not just by killing its process, to get closer to a realistic scenario.
 
-**Solution put in place:** a simulated 6-meter radio range, computed from the real GPS distance between two drones — a message received from further away is simply ignored, the same way a real radio would lose signal. Alongside that, real terminal windows were opened for each drone so connection/disconnection/election events would actually be visible live, instead of running silently in the background.
+**Solution put in place:** a simulated 6-meter radio range, computed from the real GPS distance between two drones using a flat-Earth approximation (converting degrees of latitude/longitude to meters locally, since the drones never move far enough apart for the Earth's curvature to matter) — a message received from further away is simply ignored, the same way a real radio would lose signal. Alongside that, real terminal windows were opened for each drone (macOS's `osascript`/AppleScript, one `do script` call per window) so connection/disconnection/election events would actually be visible live, instead of running silently in the background.
 
 **Test performed:** `drone_2` teleported 30 meters away using Gazebo's `set_pose` service, then brought back to its starting position.
 
