@@ -17,12 +17,12 @@ Full write-up: [`RAPPORT_EN.md`](./RAPPORT_EN.md) — the research process, the 
 
 Communication and election are done and tested; what's left is turning the elected leader into an actual flight role. Planned pace, one focus area per week:
 
-- **Week 1 — Research.** Read up on MAVSDK's offboard control API (position/velocity setpoints), PX4's flight modes and arming/safety checks, and work out how the Webots V-formation math (relative offsets behind the leader) maps onto MAVSDK's coordinate frames.
-- **Week 2 — Single-drone flight baseline.** Get one drone arming, taking off, holding position, and landing through MAVSDK offboard control in C++, before touching any multi-drone logic — a safe reference point to debug against.
-- **Week 3 — Leader flight behavior.** Port the leader's movement logic (manual/keyboard control in the Webots version) to a simple scripted flight path.
-- **Week 4 — Follower formation logic.** Implement the V-formation offsets for the followers, computed from the leader's live position — already flowing through the existing `swarm_node` communication layer, just not used for flight yet.
-- **Week 5 — Dynamic handoff in flight.** Wire the existing election logic into flight roles, so a newly-elected leader actually takes over the flight path and followers recompute their offsets relative to it.
-- **Week 6 — Testing & refinement.** Test leader failover mid-flight (not just on the ground), tune formation stability and timing, and document the remaining edge cases (e.g. a permanent network split, where two groups never reconnect and each keeps its own leader indefinitely).
+- **Jul 27 – Jul 31 — Research.** Read up on MAVSDK's offboard control API (position/velocity setpoints), PX4's flight modes and arming/safety checks, and work out how the Webots V-formation math (relative offsets behind the leader) maps onto MAVSDK's coordinate frames.
+- **Aug 3 – Aug 7 — Single-drone flight baseline.** Get one drone arming, taking off, holding position, and landing through MAVSDK offboard control in C++, before touching any multi-drone logic — a safe reference point to debug against.
+- **Aug 10 – Aug 14 — Leader flight behavior.** Port the leader's movement logic (manual/keyboard control in the Webots version) to a simple scripted flight path.
+- **Aug 17 – Aug 21 — Follower formation logic.** Implement the V-formation offsets for the followers, computed from the leader's live position — already flowing through the existing `swarm_node` communication layer, just not used for flight yet.
+- **Aug 24 – Aug 28 — Dynamic handoff in flight.** Wire the existing election logic into flight roles, so a newly-elected leader actually takes over the flight path and followers recompute their offsets relative to it.
+- **Aug 31 – Sep 4 — Testing & refinement.** Test leader failover mid-flight (not just on the ground), tune formation stability and timing, and document the remaining edge cases (e.g. a permanent network split, where two groups never reconnect and each keeps its own leader indefinitely).
 
 ##  Files
 
