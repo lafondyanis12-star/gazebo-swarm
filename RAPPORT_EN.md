@@ -132,7 +132,7 @@ cmake -S . -B build
 cmake --build build
 ```
 
-In the three following terminals, run `./build/swarm_node --id 0`, `--id 1` and `--id 2` respectively. Each terminal should print "SUCCES : signal detecte" for the other two drones within a few seconds.
+In the three following terminals, run `./build/swarm_node --id 0`, `--id 1` and `--id 2` respectively. Each terminal should print "SUCCESS: signal detected" for the other two drones within a few seconds.
 
 To simulate the leader failing:
 ```bash

@@ -1,10 +1,10 @@
-// Chaque drone lit sa propre position via MAVSDK et la balance aux 2 autres
-// par un petit reseau UDP maison (un port d'ecoute par drone).
+// Each drone reads its own position via MAVSDK and sends it to the other 2
+// over a small custom UDP mesh (one listening port per drone).
 //
-// Pourquoi pas juste ecouter les 3 flux PX4 depuis chaque noeud ? Teste,
-// ca ne marche pas : PX4 envoie vers un port fixe (14540+id) et un seul
-// process peut bind ce port. Deux noeuds qui veulent ecouter drone_0 en
-// meme temps se marchent dessus.
+// Why not just listen to all 3 PX4 streams from every node? Tried it,
+// doesn't work: PX4 sends to a fixed port (14540+id) and only one process
+// can bind that port. Two nodes both trying to listen to drone_0 step on
+// each other.
 //
 // ./swarm_node --id 0/1/2
 
@@ -32,11 +32,11 @@ using namespace std::chrono;
 namespace {
 
 constexpr int MAX_DRONES = 3;
-constexpr int PX4_BASE_PORT = 14540;      // instance i : mavsdk se connecte a udp://:14540+i
-constexpr int SWARM_BASE_PORT = 16000;    // instance i : ecoute le maillage sur 16000+i
+constexpr int PX4_BASE_PORT = 14540;      // instance i: mavsdk connects to udp://:14540+i
+constexpr int SWARM_BASE_PORT = 16000;    // instance i: listens on the mesh on 16000+i
 constexpr double BROADCAST_INTERVAL_S = 0.2;
 constexpr double TIMEOUT_S = 3.0;
-constexpr double MAX_RANGE_M = 6.0;       // portee radio simulee
+constexpr double MAX_RANGE_M = 6.0;       // simulated radio range
 constexpr double METERS_PER_DEG_LAT = 111320.0;
 
 #pragma pack(push, 1)
@@ -70,12 +70,12 @@ struct SharedState {
     std::mutex mutex;
     double my_x = 0.0, my_y = 0.0, my_z = 0.0;
     std::map<int, DroneTracker> trackers;
-    int leader_id = 0; // drone_0 est le leader initial
+    int leader_id = 0; // drone_0 is the initial leader
 };
 
-// recalcule en continu qui devrait etre leader, pas seulement quand le
-// leader courant tombe -- sinon un drone isole qui s'est elu tout seul
-// ne rend jamais la main (split-brain). A appeler avec state.mutex tenu.
+// Continuously recomputes who should be leader, not just when the current
+// leader drops -- otherwise an isolated drone that elected itself never
+// hands leadership back (split-brain). Call with state.mutex held.
 void elect_leader(SharedState& state, int my_id, const std::string& my_name) {
     std::vector<int> alive = {my_id};
     for (auto& [id, tracker] : state.trackers) {
@@ -88,12 +88,12 @@ void elect_leader(SharedState& state, int my_id, const std::string& my_name) {
     state.leader_id = new_leader;
     bool old_still_alive = std::find(alive.begin(), alive.end(), old_leader) != alive.end();
     if (!old_still_alive) {
-        std::cout << "[" << my_name << "] Nouveau leader : drone_" << new_leader << " (drone_"
-                  << old_leader << " injoignable)\n";
+        std::cout << "[" << my_name << "] New leader: drone_" << new_leader << " (drone_"
+                  << old_leader << " unreachable)\n";
     } else {
-        std::cout << "[" << my_name << "] Nouveau leader : drone_" << new_leader << " (drone_"
-                  << old_leader << " reste joignable mais drone_" << new_leader
-                  << " a priorite)\n";
+        std::cout << "[" << my_name << "] New leader: drone_" << new_leader << " (drone_"
+                  << old_leader << " still reachable but drone_" << new_leader
+                  << " takes priority)\n";
     }
 }
 
@@ -111,8 +111,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout.setf(std::ios::unitbuf); // flush a chaque ligne, sinon rien ne s'affiche
-                                        // tant que le process ne se termine pas
+    std::cout.setf(std::ios::unitbuf); // flush every line, otherwise nothing shows
+                                        // up until the process exits
 
     std::string my_name = "drone_" + std::to_string(my_id);
     SharedState state;
@@ -120,22 +120,22 @@ int main(int argc, char** argv) {
         if (i != my_id) state.trackers[i] = DroneTracker{};
     }
 
-    std::cout << "[" << my_name << "] Demarrage (" << (my_id == 0 ? "LEADER" : "SUIVEUR")
+    std::cout << "[" << my_name << "] Starting (" << (my_id == 0 ? "LEADER" : "FOLLOWER")
               << ").\n";
 
     Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
     if (mavsdk.add_any_connection("udpin://0.0.0.0:" + std::to_string(PX4_BASE_PORT + my_id)) !=
         ConnectionResult::Success) {
-        std::cerr << "[" << my_name << "] Echec de connexion MAVSDK\n";
+        std::cerr << "[" << my_name << "] MAVSDK connection failed\n";
         return 1;
     }
 
     auto system = mavsdk.first_autopilot(10.0);
     if (!system) {
-        std::cerr << "[" << my_name << "] Aucun systeme PX4 trouve\n";
+        std::cerr << "[" << my_name << "] No PX4 system found\n";
         return 1;
     }
-    std::cout << "[" << my_name << "] Connexion a sa propre instance PX4 (port "
+    std::cout << "[" << my_name << "] Connecting to its own PX4 instance (port "
               << (PX4_BASE_PORT + my_id) << ")...\n";
 
     Telemetry telemetry{system.value()};
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     recv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     recv_addr.sin_port = htons(SWARM_BASE_PORT + my_id);
     if (bind(recv_sock, reinterpret_cast<sockaddr*>(&recv_addr), sizeof(recv_addr)) < 0) {
-        std::cerr << "[" << my_name << "] Echec du bind UDP\n";
+        std::cerr << "[" << my_name << "] UDP bind failed\n";
         return 1;
     }
 
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
             auto it = state.trackers.find(packet.sender_id);
             if (it == state.trackers.end()) continue;
 
-            // portee radio simulee : un signal recu de trop loin est ignore
+            // simulated radio range: a signal received from too far away is ignored
             double dist = local_distance_m(state.my_x, state.my_y, state.my_z, packet.x,
                                             packet.y, packet.z);
             if (dist > MAX_RANGE_M) continue;
@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
             it->second.last_seen = now_s();
             if (!it->second.connected) {
                 it->second.connected = true;
-                std::cout << "[" << my_name << "] SUCCES : signal detecte de drone_"
+                std::cout << "[" << my_name << "] SUCCESS: signal detected from drone_"
                           << packet.sender_id << "\n";
             }
         }
@@ -218,8 +218,8 @@ int main(int argc, char** argv) {
                 if (tracker.connected && tracker.last_seen >= 0 &&
                     (now - tracker.last_seen) > TIMEOUT_S) {
                     tracker.connected = false;
-                    std::cout << "[" << my_name << "] Perte de signal avec drone_" << id
-                              << " !\n";
+                    std::cout << "[" << my_name << "] Signal lost with drone_" << id
+                              << "!\n";
                 }
             }
             elect_leader(state, my_id, my_name);
