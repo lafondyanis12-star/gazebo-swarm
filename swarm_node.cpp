@@ -38,15 +38,17 @@ constexpr double BROADCAST_INTERVAL_S = 0.2;
 constexpr double TIMEOUT_S = 3.0;
 constexpr double MAX_RANGE_M = 6.0;       // simulated radio range
 constexpr double METERS_PER_DEG_LAT = 111320.0;
+constexpr int NO_LEADER = -1;             // "I don't know who's leader yet"
 
 #pragma pack(push, 1)
 struct SwarmPacket {
     int32_t sender_id;
+    int32_t claimed_leader; // who the sender currently believes is leader
     double x, y, z;
     double timestamp;
 };
 #pragma pack(pop)
-static_assert(sizeof(SwarmPacket) == 36, "packet size mismatch");
+static_assert(sizeof(SwarmPacket) == 40, "packet size mismatch");
 
 double local_distance_m(double lat_a, double lon_a, double alt_a, double lat_b, double lon_b,
                          double alt_b) {
@@ -64,36 +66,76 @@ double now_s() {
 struct DroneTracker {
     double last_seen = -1.0;
     bool connected = false;
+    int last_claimed_leader = NO_LEADER; // last leader_id this peer said it believed in
 };
 
 struct SharedState {
     std::mutex mutex;
     double my_x = 0.0, my_y = 0.0, my_z = 0.0;
     std::map<int, DroneTracker> trackers;
-    int leader_id = 0; // drone_0 is the initial leader
+    int leader_id = NO_LEADER; // learned from peers or elected below, not assumed
 };
 
 // Continuously recomputes who should be leader, not just when the current
 // leader drops -- otherwise an isolated drone that elected itself never
 // hands leadership back (split-brain). Call with state.mutex held.
+//
+// Leadership is sticky: as long as the current leader is still alive, it
+// keeps the role, even if a drone with a lower ID reappears. A leader that
+// drops out and comes back doesn't get to instantly reclaim it -- it just
+// rejoins as an ordinary follower, the same spot the new leader was in
+// before taking over. If the leader genuinely disappears, the normal rule
+// kicks back in (lowest surviving ID), so a former leader can end up
+// leading again later if it's really its turn.
+//
+// A drone that just restarted (or reconnected) has no memory of any of
+// that, so it learns the current leader from `claimed_leader`, gossiped in
+// every packet: if a reachable peer already believes in a leader that's
+// still alive and different from mine, I defer to it.
+//
+// First version of this trusted *any* differing claim from *any* reachable
+// peer unconditionally, every tick -- including from a peer that only
+// believes in itself because it was isolated a moment ago. Two drones each
+// convinced they're the rightful leader would then flip-flop forever,
+// each "correcting" the other back and forth. Fix: never invent a new
+// belief (self-elect or otherwise) while completely alone -- with no one
+// around to notice, that's more likely to be me getting cut off than a
+// real failure. A lone drone just keeps repeating its last known belief
+// (possibly still NO_LEADER) until it can see someone again, so it never
+// broadcasts a bogus claim in the first place.
 void elect_leader(SharedState& state, int my_id, const std::string& my_name) {
     std::vector<int> alive = {my_id};
     for (auto& [id, tracker] : state.trackers) {
         if (tracker.connected) alive.push_back(id);
     }
-    int new_leader = *std::min_element(alive.begin(), alive.end());
-    if (new_leader == state.leader_id) return;
+    if (alive.size() == 1) return; // no one to corroborate anything with
+
+    for (int id : alive) {
+        if (id == my_id) continue;
+        int claim = state.trackers[id].last_claimed_leader;
+        if (claim < 0 || claim == state.leader_id) continue;
+        if (std::find(alive.begin(), alive.end(), claim) != alive.end()) {
+            std::cout << "[" << my_name << "] Adopting drone_" << claim
+                      << " as leader (learned from drone_" << id << ")\n";
+            state.leader_id = claim;
+            return;
+        }
+    }
+
+    if (state.leader_id != NO_LEADER &&
+        std::find(alive.begin(), alive.end(), state.leader_id) != alive.end()) {
+        return;
+    }
 
     int old_leader = state.leader_id;
+    int new_leader = *std::min_element(alive.begin(), alive.end());
+    if (new_leader == old_leader) return;
     state.leader_id = new_leader;
-    bool old_still_alive = std::find(alive.begin(), alive.end(), old_leader) != alive.end();
-    if (!old_still_alive) {
-        std::cout << "[" << my_name << "] New leader: drone_" << new_leader << " (drone_"
-                  << old_leader << " unreachable)\n";
+    if (old_leader == NO_LEADER) {
+        std::cout << "[" << my_name << "] New leader: drone_" << new_leader << "\n";
     } else {
         std::cout << "[" << my_name << "] New leader: drone_" << new_leader << " (drone_"
-                  << old_leader << " still reachable but drone_" << new_leader
-                  << " takes priority)\n";
+                  << old_leader << " unreachable)\n";
     }
 }
 
@@ -177,6 +219,7 @@ int main(int argc, char** argv) {
             if (dist > MAX_RANGE_M) continue;
 
             it->second.last_seen = now_s();
+            it->second.last_claimed_leader = packet.claimed_leader;
             if (!it->second.connected) {
                 it->second.connected = true;
                 std::cout << "[" << my_name << "] SUCCESS: signal detected from drone_"
@@ -191,6 +234,7 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
                 packet.sender_id = my_id;
+                packet.claimed_leader = state.leader_id;
                 packet.x = state.my_x;
                 packet.y = state.my_y;
                 packet.z = state.my_z;
