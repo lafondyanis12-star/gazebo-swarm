@@ -5,8 +5,15 @@
 // subscriptions) one at a time on the same thread, so there's no need for
 // the mutex the UDP version needed across its 3 threads.
 //
-// No PX4 yet: position is a fake, distinct value per drone, just to prove
-// the 3 nodes see each other and agree on a leader over real ROS 2 topics.
+// No PX4 yet: position is a fake value, just to prove the 3 nodes see each
+// other and agree on a leader over real ROS 2 topics. It's exposed as a
+// live-settable parameter (default: everyone at the origin, so all 3 start
+// in range of each other) so a disconnect can be tested by "moving" a
+// drone by hand, the same idea as the Gazebo `set_pose` service used in
+// the UDP version:
+//
+//   ros2 param set /drone_2 x 30.0   # move drone_2 out of range
+//   ros2 param set /drone_2 x 0.0    # bring it back
 //
 // ros2 run swarm_comm swarm_node --ros-args -p id:=0/1/2
 
@@ -15,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -27,6 +35,7 @@ namespace {
 
 constexpr int MAX_DRONES = 3;
 constexpr double TIMEOUT_S = 3.0;
+constexpr double MAX_RANGE_M = 6.0; // simulated radio range, same as the UDP version
 constexpr int NO_LEADER = -1; // "I don't know who's leader yet"
 
 struct DroneTracker {
@@ -35,6 +44,11 @@ struct DroneTracker {
     bool connected = false;
     int last_claimed_leader = NO_LEADER;
 };
+
+double distance_m(double x1, double y1, double z1, double x2, double y2, double z2) {
+    double dx = x1 - x2, dy = y1 - y2, dz = z1 - z2;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
 
 } // namespace
 
@@ -50,6 +64,13 @@ public:
         for (int i = 0; i < MAX_DRONES; ++i) {
             if (i != my_id_) trackers_[i]; // default-constructs via map::operator[]
         }
+
+        // Fake position, live-settable: everyone starts at the origin (all
+        // in range of each other), and `ros2 param set /drone_X x <val>`
+        // moves one at runtime to test the radio-range disconnect.
+        declare_parameter<double>("x", 0.0);
+        declare_parameter<double>("y", 0.0);
+        declare_parameter<double>("z", 0.0);
 
         pub_ = create_publisher<SwarmStatus>("/drone_" + std::to_string(my_id_) + "/swarm_status", 10);
         for (int peer = 0; peer < MAX_DRONES; ++peer) {
@@ -70,14 +91,18 @@ private:
         SwarmStatus msg;
         msg.sender_id = my_id_;
         msg.claimed_leader = leader_id_;
-        msg.x = my_id_ * 10.0; // fake position, no PX4 in this prototype
-        msg.y = 0.0;
-        msg.z = 0.0;
+        msg.x = get_parameter("x").as_double();
+        msg.y = get_parameter("y").as_double();
+        msg.z = get_parameter("z").as_double();
         msg.timestamp = now().seconds();
         pub_->publish(msg);
     }
 
     void on_peer_status(int peer, SwarmStatus::SharedPtr msg) {
+        double range = distance_m(get_parameter("x").as_double(), get_parameter("y").as_double(),
+                                   get_parameter("z").as_double(), msg->x, msg->y, msg->z);
+        if (range > MAX_RANGE_M) return; // out of simulated radio range: same as not receiving anything
+
         auto& tracker = trackers_[peer];
         tracker.last_seen = now();
         tracker.has_seen = true;
