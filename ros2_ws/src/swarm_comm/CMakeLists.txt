@@ -33,6 +33,9 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_launch_test(test/test_election.py)
 endif()
 
 ament_package()

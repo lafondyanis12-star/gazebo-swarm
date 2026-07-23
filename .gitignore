@@ -3,3 +3,4 @@ build/
 install/
 log/
 RAPPORT.md
+__pycache__/
