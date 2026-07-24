@@ -126,12 +126,22 @@ private:
         elect_leader();
     }
 
-    // Ported as-is from the UDP version's elect_leader(): sticky leadership
-    // (a leader that comes back doesn't reclaim the role -- it defers to
-    // whoever took over), learned from peers via `claimed_leader` gossiped
-    // in every message, and never inventing a new belief while completely
-    // alone (that first version, tested end to end, is what caught and
-    // fixed an infinite-oscillation bug -- see swarm_node.cpp's comments).
+    // Sticky, majority-vote election: sticky leadership (a leader that
+    // comes back doesn't reclaim the role -- it defers to whoever took
+    // over) and never inventing a new belief while completely alone (that
+    // first UDP version, tested end to end, is what caught and fixed an
+    // infinite-oscillation bug -- see swarm_node.cpp's comments).
+    //
+    // Earlier version of this adopted the first differing `claimed_leader`
+    // gossiped by any peer, in ID order. That broke when the old leader
+    // reconnects: right after reconnecting, it and its peers are *each*
+    // relaying whatever they believed a moment ago (the ex-leader's belief
+    // was frozen at itself the whole time it was alone), and depending on
+    // which stale message happens to arrive first, the group could
+    // re-adopt the ex-leader by accident. A majority vote among everyone
+    // currently alive (self included) fixes that: the 2 drones that
+    // already agree on the real leader always outvote the 1 reconnecting
+    // drone still relaying its stale belief, regardless of message timing.
     void elect_leader() {
         std::vector<int> alive = {my_id_};
         for (auto& [id, tracker] : trackers_) {
@@ -139,31 +149,45 @@ private:
         }
         if (alive.size() == 1) return;
 
+        std::map<int, int> votes;
+        // My own current belief is one vote, but only if it's still someone
+        // alive -- otherwise it's a stale belief about to be corrected, and
+        // should carry no more weight than a stale peer claim would.
+        if (leader_id_ != NO_LEADER &&
+            std::find(alive.begin(), alive.end(), leader_id_) != alive.end()) {
+            votes[leader_id_]++;
+        }
         for (int id : alive) {
             if (id == my_id_) continue;
             int claim = trackers_[id].last_claimed_leader;
-            if (claim < 0 || claim == leader_id_) continue;
-            if (std::find(alive.begin(), alive.end(), claim) != alive.end()) {
-                RCLCPP_INFO(get_logger(), "[%s] Adopting drone_%d as leader (learned from drone_%d)",
-                            my_name_.c_str(), claim, id);
-                leader_id_ = claim;
-                return;
+            if (claim >= 0 && std::find(alive.begin(), alive.end(), claim) != alive.end()) {
+                votes[claim]++;
             }
         }
 
-        if (leader_id_ != NO_LEADER &&
-            std::find(alive.begin(), alive.end(), leader_id_) != alive.end()) {
-            return;
+        int winner = NO_LEADER, winner_votes = 0, tied_with = 0;
+        for (auto& [candidate, count] : votes) {
+            if (count > winner_votes) {
+                winner = candidate;
+                winner_votes = count;
+                tied_with = 0;
+            } else if (count == winner_votes) {
+                ++tied_with;
+            }
         }
+        // No usable votes yet, or a tie nobody breaks (e.g. fresh boot,
+        // everyone still claims NO_LEADER): fall back to smallest alive ID.
+        int new_leader = (winner == NO_LEADER || tied_with > 0)
+            ? *std::min_element(alive.begin(), alive.end())
+            : winner;
 
         int old_leader = leader_id_;
-        int new_leader = *std::min_element(alive.begin(), alive.end());
         if (new_leader == old_leader) return;
         leader_id_ = new_leader;
         if (old_leader == NO_LEADER) {
             RCLCPP_INFO(get_logger(), "[%s] New leader: drone_%d", my_name_.c_str(), new_leader);
         } else {
-            RCLCPP_INFO(get_logger(), "[%s] New leader: drone_%d (drone_%d unreachable)",
+            RCLCPP_INFO(get_logger(), "[%s] New leader: drone_%d (was drone_%d)",
                         my_name_.c_str(), new_leader, old_leader);
         }
     }
