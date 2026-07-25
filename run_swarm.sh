@@ -37,7 +37,12 @@ PX4_GZ_WORLD="$WORLD_NAME" PX4_GZ_MODEL_NAME=x500_0 \
   PX4_SYS_AUTOSTART=4001 "$BIN" -i 0 &
 pids+=($!)
 
-sleep 15  # laisse le temps à Gazebo de démarrer avant d'attacher les suivantes
+sleep 25  # laisse le temps à Gazebo de démarrer avant d'attacher les suivantes
+# (25s, pas 15s : sous charge -- typiquement quand test_formation.py lance
+# les 3 processus swarm_node en même temps que ce script -- Gazebo peut
+# prendre plus de temps à répondre à /scene/info, et les instances 1/2
+# n'ont que 30s de leur côté (check_scene_info dans px4-rc.gzsim) avant
+# d'abandonner avec "Timed out waiting for Gazebo world".
 
 echo "Démarrage de drone_1 (s'attache à x500_1, déjà présent dans le monde)..."
 PX4_GZ_STANDALONE=1 PX4_GZ_WORLD="$WORLD_NAME" PX4_GZ_MODEL_NAME=x500_1 PX4_SYS_AUTOSTART=4001 "$BIN" -i 1 &

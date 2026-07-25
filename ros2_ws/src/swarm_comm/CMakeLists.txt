@@ -10,8 +10,15 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(swarm_msgs REQUIRED)
 
+# MAVSDK (real PX4 flight: Telemetry/Action/Offboard) -- installed via
+# `brew install mavsdk`, which doesn't drop its CMake config on the default
+# search path, so point CMake at the Homebrew prefix explicitly.
+list(APPEND CMAKE_PREFIX_PATH /opt/homebrew/opt/mavsdk)
+find_package(MAVSDK REQUIRED)
+
 add_executable(swarm_node src/swarm_node.cpp)
 ament_target_dependencies(swarm_node rclcpp swarm_msgs)
+target_link_libraries(swarm_node MAVSDK::mavsdk)
 
 install(TARGETS
   swarm_node

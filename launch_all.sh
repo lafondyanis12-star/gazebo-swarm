@@ -19,8 +19,8 @@ tell application "Terminal"
 end tell
 OSA
 
-echo "Gazebo + PX4 lances. Attente d'environ 25s avant de demarrer la communication..."
-sleep 25
+echo "Gazebo + PX4 lances. Attente d'environ 40s avant de demarrer la communication..."
+sleep 40  # run_swarm.sh attend maintenant lui-meme 25s avant de demarrer drone_1/2
 
 osascript <<OSA
 tell application "Terminal"

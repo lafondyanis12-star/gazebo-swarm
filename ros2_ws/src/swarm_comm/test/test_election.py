@@ -39,6 +39,17 @@ def set_x(drone_name, value):
     )
 
 
+def get_claimed_leader(drone_name):
+    out = subprocess.run(
+        ['ros2', 'topic', 'echo', '--once', f'/{drone_name}/swarm_status'],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout
+    for line in out.splitlines():
+        if line.startswith('claimed_leader:'):
+            return int(line.split(':')[1].strip())
+    raise RuntimeError(f'no claimed_leader in output from {drone_name}: {out!r}')
+
+
 class TestSwarmElection(unittest.TestCase):
     """
     Election scenarios, run in definition order against the same 3 nodes.
@@ -49,11 +60,19 @@ class TestSwarmElection(unittest.TestCase):
     """
 
     def test_1_initial_election(self, proc_output, drone_0, drone_1, drone_2):
+        # Which of the 3 wins is a timing race (each node picks the min ID
+        # of *its own* alive set the instant its election timer fires, and
+        # with near-simultaneous discovery there's no strict ordering
+        # guarantee -- see elect_leader()'s comments in swarm_node.cpp).
+        # What must hold is consensus, not a specific winner: all 3 settle
+        # on the same leader.
         for name, proc in (('drone_0', drone_0), ('drone_1', drone_1), ('drone_2', drone_2)):
-            proc_output.assertWaitFor('New leader: drone_0', process=proc, timeout=10)
+            proc_output.assertWaitFor('New leader: drone_', process=proc, timeout=10)
+        leaders = {name: get_claimed_leader(name) for name in ('drone_0', 'drone_1', 'drone_2')}
+        self.assertEqual(len(set(leaders.values())), 1, f'no consensus: {leaders}')
 
     def test_2_range_disconnect_and_reconnect(self, proc_output, drone_0, drone_1, drone_2):
-        set_x('drone_2', 30.0)  # 30m > MAX_RANGE_M (6m)
+        set_x('drone_2', 30.0)  # 30m > MAX_RANGE_M (10m)
         proc_output.assertWaitFor('Signal lost with drone_2!', process=drone_0, timeout=6)
         proc_output.assertWaitFor('Signal lost with drone_2!', process=drone_1, timeout=6)
 
@@ -63,6 +82,12 @@ class TestSwarmElection(unittest.TestCase):
         proc_output.assertWaitFor(signal_2, process=drone_1, timeout=6)
 
     def test_3_total_isolation_freezes_leader_belief(self, proc_output, drone_0, drone_1, drone_2):
+        # Re-check who's leading right now rather than trusting test_1's
+        # result: test_2's disconnect/reconnect of drone_2 could in
+        # principle have flipped leadership in between (e.g. if drone_2
+        # itself had been leader) -- current, not remembered, state.
+        current_leader = f'drone_{get_claimed_leader("drone_0")}'
+
         # Scatter all 3 so every pairwise distance is > MAX_RANGE_M.
         set_x('drone_0', 0.0)
         set_x('drone_1', 100.0)
@@ -72,11 +97,16 @@ class TestSwarmElection(unittest.TestCase):
             proc_output.assertWaitFor('Signal lost with', process=proc, timeout=6)
 
         # Give the 500ms election timer several ticks to prove the point,
-        # then confirm drone_1 and drone_2 did NOT invent themselves as
+        # then confirm the 2 non-leader drones did NOT invent themselves as
         # leader while completely alone -- the split-brain behavior the
-        # `if (alive.size() == 1) return;` guard exists to prevent.
+        # `if (alive.size() == 1) return;` guard exists to prevent. (Which
+        # drone leads is a timing race resolved in test_1 -- see its
+        # comments -- so the followers to check are derived from that,
+        # not hardcoded.)
         time.sleep(2)
-        for name, proc in (('drone_1', drone_1), ('drone_2', drone_2)):
+        procs = {'drone_0': drone_0, 'drone_1': drone_1, 'drone_2': drone_2}
+        followers = [(name, proc) for name, proc in procs.items() if name != current_leader]
+        for name, proc in followers:
             with self.assertRaises(AssertionError, msg=f'{name} elected itself while isolated'):
                 proc_output.assertWaitFor(f'New leader: {name}', process=proc, timeout=1)
 
