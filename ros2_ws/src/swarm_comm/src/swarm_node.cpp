@@ -100,6 +100,11 @@ constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between an
 // tick from breaching it further on any real closing speed.
 constexpr double AVOID_MARGIN_M = 1.4;
 
+// Consecutive control ticks (at CONTROL_PERIOD_S each) a peer can stay
+// inside SAFE_DIST_M before it's treated as chronic rather than a
+// momentary close call -- see control_step()'s use of close_encounter_ticks_.
+constexpr int CHRONIC_TICKS_THRESHOLD = 20; // 2s at the 10Hz control rate
+
 // Triangle formation, in the leader's own forward/right frame.
 constexpr double FORMATION_TRAIL_M = 1.5;    // behind the leader
 constexpr double FORMATION_HALF_WIDTH_M = 1.0;
@@ -528,6 +533,29 @@ private:
         if (min_dist < SAFE_DIST_M) {
             RCLCPP_WARN(get_logger(), "[%s] SEPARATION: %.2fm from a peer, inside the %.1fm floor",
                         my_name_.c_str(), min_dist, SAFE_DIST_M);
+            ++close_encounter_ticks_;
+        } else {
+            close_encounter_ticks_ = 0;
+        }
+
+        // A momentary close call and a *chronic* one need different
+        // responses. Live testing traced ~half of all flights to a hard
+        // geofence trigger (40m+ drift) with no single dramatic cause --
+        // instead, a peer staying inside the 1m floor for minutes at a
+        // time kept the priority blend below permanently diverting *some*
+        // of the speed budget away from pure escape and into
+        // formation-seeking, which (if that seeking is itself part of
+        // what's causing the conflict) never lets the gap fully close --
+        // just enough net bias, sustained long enough, to add up to a
+        // large drift with no single moment that looks like a bug. Past
+        // CHRONIC_TICKS_THRESHOLD, drop formation-seeking entirely and
+        // spend the whole speed budget on escaping -- once clear,
+        // close_encounter_ticks_ resets and normal blending resumes.
+        bool chronic = close_encounter_ticks_ > CHRONIC_TICKS_THRESHOLD;
+        if (chronic && close_encounter_ticks_ % 20 == 0) {
+            RCLCPP_ERROR(get_logger(),
+                "[%s] CHRONIC proximity for %.1fs -- pure escape, formation-seeking suspended",
+                my_name_.c_str(), close_encounter_ticks_ * CONTROL_PERIOD_S);
         }
 
         // Priority blend, not a plain vector sum: as repulsion strengthens,
@@ -537,7 +565,7 @@ private:
         // direction loses out. A live test showed the old additive
         // approach let a strong seek command water down avoidance right
         // when a peer was closest -- exactly the wrong moment for that.
-        double repulsion_weight = std::clamp(repulsion_mag / MAX_SPEED_M_S, 0.0, 1.0);
+        double repulsion_weight = chronic ? 1.0 : std::clamp(repulsion_mag / MAX_SPEED_M_S, 0.0, 1.0);
         Vec3 blended{
             desired.x * (1.0 - repulsion_weight) + repulsion.x,
             desired.y * (1.0 - repulsion_weight) + repulsion.y,
@@ -780,6 +808,7 @@ private:
     std::atomic<int> last_logged_flight_mode_{-1}; // -1: nothing logged yet
     std::atomic<int> current_flight_mode_{-1}; // mavsdk::Telemetry::FlightMode, cast to int
     int offboard_failure_count_ = 0;
+    int close_encounter_ticks_ = 0; // consecutive ticks with a peer inside SAFE_DIST_M
 
     // Written by the MAVSDK telemetry thread, read by the ROS timer thread.
     std::atomic<double> my_x_{0}, my_y_{0}, my_z_{0};
