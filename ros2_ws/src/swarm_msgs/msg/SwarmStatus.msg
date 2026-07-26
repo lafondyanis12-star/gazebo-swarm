@@ -17,3 +17,13 @@ float64 ref_vy          # Only meaningful when sender believes itself leader: th
                          # telemetry-derived one. Followers feedforward off this instead -- it's
                          # exactly what the leader is trying to fly, without its own tracking lag
                          # or MAVSDK telemetry noise riding along. 0 when sender is a follower.
+bool ready               # True once this drone has actually reached Offboard and is flying real
+                         # setpoints -- false while still connecting/arming/taking off, even if it
+                         # already believes itself leader. A drone that fails to ever connect to
+                         # its own PX4 instance still elects itself leader over the radio link (the
+                         # election only needs message traffic, not flight) and would otherwise
+                         # broadcast x/y/z frozen at 0 plus a fully-formed ref_vx/ref_vy from the
+                         # scripted path it is not actually flying -- a live test traced a follower
+                         # drifting 15m+ chasing exactly this "ghost leader" feedforward with no
+                         # real leader motion to correct against. Followers must not trust a leader
+                         # claim until this is true.

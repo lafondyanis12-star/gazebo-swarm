@@ -88,6 +88,38 @@ constexpr double CONTROL_PERIOD_S = 0.1;     // 10Hz: broadcast + Offboard setpo
 constexpr double MAX_SPEED_M_S = 3.5;
 constexpr double SEEK_KP = 0.8;              // proportional gain, target position -> velocity
 
+// Damping gain: pulls back on however much my *actual* velocity (real MAVSDK
+// telemetry, not the setpoint just sent) exceeds the feedforward term. A
+// live test with KP-only (+ feedforward) control caught a drone that had
+// been pushed well off its target oscillating -- closing more than half the
+// gap, then reversing and diverging *further* than where it started, with
+// no further leader handoff or repulsion event to explain it (repulsion was
+// 0 throughout) -- textbook underdamped feedback fighting real vehicle
+// inertia/lag PX4's own velocity controller can't erase instantly. A pure
+// P(+FF) term has no way to see that: it only reacts to the position gap,
+// never to the fact that the vehicle is already carrying real velocity that
+// the next setpoint hasn't caught up with yet. Damping directly against
+// that real velocity turns this into a proper PD loop and removes the
+// oscillation.
+constexpr double SEEK_KD = 0.6;
+
+// Formation-seeking (not repulsion -- see below) is speed-capped for this
+// long right after becoming airborne, ramping linearly from
+// TAKEOFF_SPEED_CAP_M_S up to the normal MAX_SPEED_M_S. All 3 drones spawn
+// only 2m apart and every one of them independently converges on its
+// formation slot the instant it's airborne -- at full MAX_SPEED_M_S closing
+// speed on each side, a live test traced pairs closing to 0.18-0.29m (very
+// likely an actual airframe collision in Gazebo, not just a logical
+// proximity warning -- see separation_repulsion()'s comment) within about
+// two 10Hz control ticks of entering the repulsion margin, faster than the
+// control loop or a stronger repulsion ramp could react to. Slowing the
+// deliberate, known-hazardous first few seconds gives both the loop and
+// repulsion time to actually work. Repulsion itself is deliberately exempt
+// -- it keeps full authority throughout, so an actual close encounter still
+// gets maximum escape speed even during the slow-start window.
+constexpr double TAKEOFF_SPEED_CAP_M_S = 1.0;
+constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;
+
 constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between any 2 drones
 
 // Repulsion starts ramping at this distance, well before SAFE_DIST_M --
@@ -153,6 +185,27 @@ constexpr double MAX_ALT_M = 6.0;
 constexpr double MAX_ALT_HARD_M = 10.0;
 constexpr double MAX_GEOFENCE_HARD_M = 40.0;
 
+// Low-altitude counterpart to MAX_ALT_HARD_M -- well below MIN_ALT_M's
+// already-clamped target band, so normal flight (including post-takeoff
+// convergence chaos) never comes near it. A live test traced a drone's
+// *actual* altitude sagging to -4.83m -- i.e. well below the ground plane,
+// something a target clamp alone can't explain -- immediately followed by a
+// real MAVSDK-measured velocity spike over 15 m/s with no setpoint anywhere
+// near that: Gazebo reacting to the vehicle skimming/clipping the ground
+// with an unrealistic collision impulse. Landing here, the same response
+// already used for the other hard backstops, catches the sag within one
+// control tick of crossing this floor -- long before it's deep enough for
+// that impulse to happen -- rather than continuing to fight it from inside
+// Offboard while the discrepancy grows.
+constexpr double MIN_ALT_HARD_M = 0.3;
+
+// Diagnostic instrumentation kept permanently for the still-open
+// low-altitude physics anomaly (see MIN_ALT_HARD_M): once a drone strays
+// this far from origin (well before MAX_GEOFENCE_HARD_M), dump full
+// per-tick internal state so a horizontal excursion can be traced as it
+// forms rather than only caught after the fact at 40m.
+constexpr double DRIFT_TRACE_M = 12.0;
+
 struct Vec3 {
     double x = 0, y = 0, z = 0; // east, north, up
 };
@@ -162,12 +215,26 @@ double distance_m(double x1, double y1, double z1, double x2, double y2, double 
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+// Clamps horizontal and vertical speed *separately*, not the 3D vector as a
+// single magnitude. A live test traced a drone's altitude sagging to
+// negative (below the ground plane) during a large horizontal excursion --
+// with a single combined clamp, a big horizontal correction (seen well past
+// 10-20 m/s during an active divergence) forces the same scale-down factor
+// onto the altitude term too, crushing whatever climb correction was needed
+// right when the vehicle most needed it, in favor of horizontal chase speed
+// it can't even use productively past MAX_SPEED_M_S anyway. Gazebo then
+// reacted to the vehicle skimming/clipping the ground with an unrealistic
+// collision impulse -- a real velocity spike (over 15 m/s actual, measured
+// via telemetry) with no matching setpoint anywhere near that. Giving
+// altitude its own speed budget means it's never starved by horizontal
+// chaos.
 Vec3 clamp_speed(Vec3 v, double max_speed) {
-    double mag = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (mag > max_speed && mag > 1e-6) {
-        double s = max_speed / mag;
-        v.x *= s; v.y *= s; v.z *= s;
+    double horiz = std::hypot(v.x, v.y);
+    if (horiz > max_speed && horiz > 1e-6) {
+        double s = max_speed / horiz;
+        v.x *= s; v.y *= s;
     }
+    v.z = std::clamp(v.z, -max_speed, max_speed);
     return v;
 }
 
@@ -240,11 +307,12 @@ Vec3 rotate_formation_offset(double forward_m, double right_m, double heading_ra
 // -avoidance, pre-clamp). Kept free of ROS/MAVSDK types so the formation
 // math is exercised the same way whether driven by real telemetry or a
 // kinematic stand-in.
-Vec3 seek_velocity(const Vec3& target, const Vec3& my_pos, const Vec3& feedforward = Vec3{}) {
+Vec3 seek_velocity(const Vec3& target, const Vec3& my_pos, const Vec3& my_vel,
+                    const Vec3& feedforward = Vec3{}) {
     Vec3 v;
-    v.x = feedforward.x + SEEK_KP * (target.x - my_pos.x);
-    v.y = feedforward.y + SEEK_KP * (target.y - my_pos.y);
-    v.z = feedforward.z + SEEK_KP * (target.z - my_pos.z);
+    v.x = feedforward.x + SEEK_KP * (target.x - my_pos.x) - SEEK_KD * (my_vel.x - feedforward.x);
+    v.y = feedforward.y + SEEK_KP * (target.y - my_pos.y) - SEEK_KD * (my_vel.y - feedforward.y);
+    v.z = feedforward.z + SEEK_KP * (target.z - my_pos.z) - SEEK_KD * (my_vel.z - feedforward.z);
     return v;
 }
 
@@ -254,16 +322,47 @@ Vec3 seek_velocity(const Vec3& target, const Vec3& my_pos, const Vec3& feedforwa
 // linearly: a gentle early nudge that only becomes sharply repulsive
 // right near the floor, not a switch that's off right up until the
 // instant a violation is already happening.
+//
+// The ramp reaches *full* strength (matching MAX_SPEED_M_S, same budget as
+// formation-seeking, via the priority blend in control_step()) exactly at
+// SAFE_DIST_M, not only as d approaches 0 -- a live test caught a pair
+// closing at up to MAX_SPEED_M_S each (7 m/s combined) blow straight through
+// the floor to 0.18m apart in about two 10Hz control ticks, because
+// normalizing the ramp against the *full* AVOID_MARGIN_M interval meant
+// strength was still only ~8% at the floor itself (it wouldn't reach 100%
+// until d neared 0) -- weakest exactly where it's supposed to be a hard
+// limit. 0.18m between two multirotor airframes is almost certainly an
+// actual physical collision in Gazebo, not just a logical proximity
+// warning, and no control-law correction after that point can undo the loss
+// of authority a real collision causes (this is the same mechanism behind
+// the sudden real-telemetry velocity spikes traced to MIN_ALT_HARD_M).
+// Normalizing against (AVOID_MARGIN_M - SAFE_DIST_M) instead means the
+// early-warning zone above the floor keeps the same gentle quadratic
+// character, but nothing between the floor and total collision is ever
+// weaker than full authority.
+//
+// Horizontal distance/push only -- deliberately never touches z. The
+// triangle formation is flat by design (every offset's up_m is 0; leader and
+// both followers all target the same altitude), so two drones ever needing
+// separation are, by construction, close in altitude too, not stacked. A 3D
+// push used to add a vertical component sized off of whichever tiny altitude
+// difference happened to exist at that instant -- and a live test found that
+// during the post-takeoff convergence chaos (drones still closing on their
+// formation slots, near cruise altitudes already close to the floor),
+// landing on the "push down" side of that coin was enough on its own to sag
+// a drone toward/through the ground and into an unrealistic Gazebo collision
+// impulse (see MIN_ALT_HARD_M). Since vertical separation was never doing
+// real collision-avoidance work here (the formation has none to preserve),
+// dropping it removes the risk without giving up anything.
 Vec3 separation_repulsion(const Vec3& my_pos, const std::vector<Vec3>& peer_positions) {
     Vec3 push;
     for (const auto& p : peer_positions) {
-        double d = distance_m(my_pos.x, my_pos.y, my_pos.z, p.x, p.y, p.z);
+        double d = std::hypot(my_pos.x - p.x, my_pos.y - p.y);
         if (d < AVOID_MARGIN_M && d > 1e-3) {
-            double t = (AVOID_MARGIN_M - d) / AVOID_MARGIN_M; // 0..1
-            double strength = t * t; // quadratic: gentle early, sharp near the floor
+            double t = std::clamp((AVOID_MARGIN_M - d) / (AVOID_MARGIN_M - SAFE_DIST_M), 0.0, 1.0);
+            double strength = t * t; // quadratic: gentle early, full strength by the floor
             push.x += (my_pos.x - p.x) / d * strength * MAX_SPEED_M_S;
             push.y += (my_pos.y - p.y) / d * strength * MAX_SPEED_M_S;
-            push.z += (my_pos.z - p.z) / d * strength * MAX_SPEED_M_S;
         }
     }
     return push;
@@ -278,6 +377,7 @@ struct DroneTracker {
     int last_claimed_leader = NO_LEADER;
     Vec3 pos, vel;
     Vec3 ref_vel; // analytical scripted-path velocity, only meaningful while this peer is leader
+    bool ready = false; // this peer's own offboard_ready_ -- see SwarmStatus.msg's `ready` field
 };
 
 class SwarmNode : public rclcpp::Node {
@@ -467,6 +567,7 @@ private:
         }
 
         RCLCPP_INFO(get_logger(), "[%s] Airborne, in Offboard.", my_name_.c_str());
+        airborne_since_s_.store(now().seconds());
         offboard_ready_.store(true);
     }
 
@@ -483,7 +584,14 @@ private:
         msg.vx = my_vel.x; msg.vy = my_vel.y; msg.vz = my_vel.z;
         msg.timestamp = now().seconds();
         for (auto& [id, tracker] : trackers_) msg.peer_connected[id] = tracker.connected;
-        if (leader_id_ == my_id_) {
+        msg.ready = offboard_ready_.load();
+        // Only publish a reference velocity once actually flying it -- a drone that has
+        // claimed leadership over the radio link but never reached Offboard (e.g. its own
+        // MAVSDK connection never came up) would otherwise still broadcast a fully-formed,
+        // plausible-looking ref_vx/ref_vy from the scripted path it isn't really flying,
+        // with x/y/z frozen at 0. See `ready`'s comment in SwarmStatus.msg for what that
+        // caused a follower to do.
+        if (leader_id_ == my_id_ && offboard_ready_.load()) {
             auto ref = flight_pattern_ == "line"
                 ? line_reference(now().seconds(), line_phase_offset_)
                 : loiter_reference(now().seconds(), loiter_phase_offset_);
@@ -505,6 +613,15 @@ private:
             if (action_) action_->land();
             return;
         }
+        if (my_pos.z < MIN_ALT_HARD_M) {
+            // See MIN_ALT_HARD_M's comment: catches a dangerous sag toward/through the
+            // ground early, before Gazebo's physics reacts to it.
+            RCLCPP_ERROR(get_logger(), "[%s] Altitude %.1fm under hard low-altitude limit -- landing.",
+                         my_name_.c_str(), my_pos.z);
+            offboard_ready_.store(false);
+            if (action_) action_->land();
+            return;
+        }
         if (std::hypot(my_pos.x, my_pos.y) > MAX_GEOFENCE_HARD_M) {
             // Same idea, horizontally: clamp_to_geofence() only bounds
             // where a target is aimed, not how far a drone already
@@ -517,7 +634,16 @@ private:
             return;
         }
 
-        Vec3 desired = compute_role_velocity(my_pos);
+        Vec3 desired = compute_role_velocity(my_pos, my_vel);
+        // Speed-cap formation-seeking only (not repulsion, computed below with its
+        // own full-strength authority) for a few seconds after becoming airborne --
+        // see TAKEOFF_SPEED_RAMP_S's comment for why.
+        double airborne_elapsed_s = now().seconds() - airborne_since_s_.load();
+        double takeoff_speed_cap = airborne_elapsed_s < TAKEOFF_SPEED_RAMP_S
+            ? TAKEOFF_SPEED_CAP_M_S +
+                  (MAX_SPEED_M_S - TAKEOFF_SPEED_CAP_M_S) * (airborne_elapsed_s / TAKEOFF_SPEED_RAMP_S)
+            : MAX_SPEED_M_S;
+        desired = clamp_speed(desired, takeoff_speed_cap);
         std::vector<Vec3> peer_positions;
         for (auto& [id, tracker] : trackers_) {
             if (tracker.connected) peer_positions.push_back(tracker.pos);
@@ -569,9 +695,36 @@ private:
         Vec3 blended{
             desired.x * (1.0 - repulsion_weight) + repulsion.x,
             desired.y * (1.0 - repulsion_weight) + repulsion.y,
-            desired.z * (1.0 - repulsion_weight) + repulsion.z,
+            // Not blended by repulsion_weight: repulsion is horizontal-only (see
+            // separation_repulsion()'s comment), so repulsion.z is always 0 -- blending it
+            // here the same way as x/y would crush altitude correction toward 0 any time
+            // horizontal repulsion is strong or chronic, exactly the case a live test
+            // caught: desired.z=3.5 (climbing hard, correctly) but command.z=0.00 at
+            // w=1.00, while real telemetry showed the drone in freefall at -7 m/s. Altitude
+            // has nothing to do with horizontal avoidance, so it keeps full authority always.
+            desired.z,
         };
         Vec3 command = clamp_speed(blended, MAX_SPEED_M_S);
+
+        if (std::hypot(my_pos.x, my_pos.y) > DRIFT_TRACE_M) {
+            RCLCPP_WARN(get_logger(),
+                "[%s] DRIFT_TRACE role=%s pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) min_dist=%.2f "
+                "desired=(%.2f,%.2f) repulsion=(%.2f,%.2f) w=%.2f chronic=%d "
+                "command=(%.2f,%.2f)",
+                my_name_.c_str(), (leader_id_ == my_id_ ? "leader" : "follower"),
+                my_pos.x, my_pos.y, my_pos.z, my_vel.x, my_vel.y, min_dist,
+                desired.x, desired.y, repulsion.x, repulsion.y,
+                repulsion_weight, chronic ? 1 : 0, command.x, command.y);
+        }
+        // Same idea as DRIFT_TRACE, kept permanently: traces the still-open
+        // low-altitude physics anomaly, firing before MIN_ALT_HARD_M does.
+        if (my_pos.z < 1.2) {
+            RCLCPP_WARN(get_logger(),
+                "[%s] ALT_TRACE role=%s z=%.2f vz=%.2f desired.z=%.2f repulsion.z=%.2f "
+                "w=%.2f command.z=%.2f",
+                my_name_.c_str(), (leader_id_ == my_id_ ? "leader" : "follower"),
+                my_pos.z, my_vel.z, desired.z, repulsion.z, repulsion_weight, command.z);
+        }
 
         // NED = (north, east, down); command is stored (east, north, up).
         auto res = offboard_->set_velocity_ned(
@@ -585,16 +738,22 @@ private:
     // Leader: pursue the scripted loiter reference (feedforward + feedback).
     // Follower: hold a triangle-formation offset on the live leader.
     // Neither role known yet, or leader's position not seen yet: hover.
-    Vec3 compute_role_velocity(const Vec3& my_pos) {
+    Vec3 compute_role_velocity(const Vec3& my_pos, const Vec3& my_vel) {
         if (leader_id_ == my_id_) {
             auto ref = flight_pattern_ == "line"
                 ? line_reference(now().seconds(), line_phase_offset_)
                 : loiter_reference(now().seconds(), loiter_phase_offset_);
             ref.pos = clamp_to_geofence(ref.pos);
-            return seek_velocity(ref.pos, my_pos, ref.vel);
+            return seek_velocity(ref.pos, my_pos, my_vel, ref.vel);
         }
-        if (leader_id_ == NO_LEADER || !trackers_[leader_id_].has_seen) {
-            return Vec3{}; // hover in place, nothing to follow yet
+        if (leader_id_ == NO_LEADER || !trackers_[leader_id_].has_seen ||
+            !trackers_[leader_id_].ready) {
+            // Nothing to follow yet -- either no leader, or the elected leader hasn't
+            // actually reached Offboard (its claim is over the radio link alone, not
+            // contingent on flying). Chasing it before then means chasing x/y/z frozen at
+            // 0 plus a ref_vel that no longer even gets sent (see the `ready` gate on
+            // publish, above) -- hover in place instead.
+            return Vec3{};
         }
         const auto& leader = trackers_[leader_id_];
         // Threshold for "trust this velocity sample enough to update
@@ -633,7 +792,7 @@ private:
         // correcting the offset error on top of that is standard
         // formation-control practice, and is what makes catching up to /
         // holding station on a moving leader possible.
-        return seek_velocity(target, my_pos, leader.ref_vel);
+        return seek_velocity(target, my_pos, my_vel, leader.ref_vel);
     }
 
     // Deterministic slot assignment among the (up to) 2 non-leader drones:
@@ -666,6 +825,7 @@ private:
         tracker.pos = Vec3{msg->x, msg->y, msg->z};
         tracker.vel = Vec3{msg->vx, msg->vy, msg->vz};
         tracker.ref_vel = Vec3{msg->ref_vx, msg->ref_vy, 0.0};
+        tracker.ready = msg->ready;
         if (!tracker.connected) {
             tracker.connected = true;
             RCLCPP_INFO(get_logger(), "[%s] SUCCESS: signal detected from drone_%d",
@@ -805,6 +965,7 @@ private:
     std::unique_ptr<mavsdk::Action> action_;
     std::unique_ptr<mavsdk::Offboard> offboard_;
     std::atomic<bool> offboard_ready_{false};
+    std::atomic<double> airborne_since_s_{0.0}; // now().seconds() when Offboard was entered
     std::atomic<int> last_logged_flight_mode_{-1}; // -1: nothing logged yet
     std::atomic<int> current_flight_mode_{-1}; // mavsdk::Telemetry::FlightMode, cast to int
     int offboard_failure_count_ = 0;

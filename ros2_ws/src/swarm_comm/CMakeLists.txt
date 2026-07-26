@@ -10,6 +10,17 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(swarm_msgs REQUIRED)
 
+# Explicit RPATH to swarm_msgs' installed lib dir: on macOS, dyld does not
+# consistently pick up DYLD_LIBRARY_PATH (set by install/setup.zsh) through
+# every process-launch path this binary runs under -- notably, both `nohup`
+# and colcon/ament's own `launch_testing` invocation (ctest -> run_test.py)
+# strip it before exec'ing the actual node, causing a
+# "Library not loaded: @rpath/libswarm_msgs__..." crash that only shows up
+# outside of a plain interactive `ros2 run`. Baking the absolute path in
+# means the binary never depends on that environment variable surviving.
+get_filename_component(SWARM_MSGS_LIB_DIR "${swarm_msgs_DIR}/../../../lib" ABSOLUTE)
+list(APPEND CMAKE_INSTALL_RPATH "${SWARM_MSGS_LIB_DIR}")
+
 # MAVSDK (real PX4 flight: Telemetry/Action/Offboard) -- installed via
 # `brew install mavsdk`, which doesn't drop its CMake config on the default
 # search path, so point CMake at the Homebrew prefix explicitly.
