@@ -497,6 +497,43 @@ private:
             }
         });
 
+        // Diagnostic instrumentation for the still-open freefall investigation
+        // (see MIN_ALT_HARD_M / README's "What's left"): PX4 flags crash
+        // detection, failsafes, and landed-state transitions through these
+        // channels well before/independent of anything swarm_node itself
+        // computes -- if this is a real PX4-side event (crash detector,
+        // EKF reset, a disarm) rather than a pure Gazebo physics glitch, this
+        // is where it would show up.
+        telemetry_->subscribe_status_text([this](mavsdk::Telemetry::StatusText st) {
+            RCLCPP_WARN(get_logger(), "[%s] PX4 STATUSTEXT: %s", my_name_.c_str(), st.text.c_str());
+        });
+        telemetry_->subscribe_armed([this](bool armed) {
+            bool a = armed;
+            if (a != last_logged_armed_.exchange(a)) {
+                RCLCPP_WARN(get_logger(), "[%s] PX4 armed state changed: %s",
+                            my_name_.c_str(), a ? "ARMED" : "DISARMED");
+            }
+        });
+        telemetry_->subscribe_landed_state([this](mavsdk::Telemetry::LandedState state) {
+            auto s = static_cast<int>(state);
+            if (s != last_logged_landed_state_.exchange(s)) {
+                std::ostringstream oss;
+                oss << state;
+                RCLCPP_WARN(get_logger(), "[%s] PX4 landed_state changed: %s",
+                            my_name_.c_str(), oss.str().c_str());
+            }
+        });
+        // Diagnostic-only (freefall investigation): if a real physical
+        // collision knocked the vehicle's attitude off, the outer velocity
+        // loop commanding a climb wouldn't show it directly -- most of the
+        // thrust vector could be pointing sideways rather than up, which
+        // would explain climbing hard while still losing altitude with no
+        // PX4-side failsafe/crash-detect message (see STATUSTEXT above).
+        telemetry_->subscribe_attitude_euler([this](mavsdk::Telemetry::EulerAngle angle) {
+            my_roll_deg_.store(angle.roll_deg);
+            my_pitch_deg_.store(angle.pitch_deg);
+        });
+
         RCLCPP_INFO(get_logger(), "[%s] Waiting for global + home position...", my_name_.c_str());
         // Captured by value (shared_ptr) rather than by reference: this
         // subscription is never explicitly cancelled, so a by-reference
@@ -721,9 +758,10 @@ private:
         if (my_pos.z < 1.2) {
             RCLCPP_WARN(get_logger(),
                 "[%s] ALT_TRACE role=%s z=%.2f vz=%.2f desired.z=%.2f repulsion.z=%.2f "
-                "w=%.2f command.z=%.2f",
+                "w=%.2f command.z=%.2f roll=%.1f pitch=%.1f",
                 my_name_.c_str(), (leader_id_ == my_id_ ? "leader" : "follower"),
-                my_pos.z, my_vel.z, desired.z, repulsion.z, repulsion_weight, command.z);
+                my_pos.z, my_vel.z, desired.z, repulsion.z, repulsion_weight, command.z,
+                my_roll_deg_.load(), my_pitch_deg_.load());
         }
 
         // NED = (north, east, down); command is stored (east, north, up).
@@ -967,6 +1005,8 @@ private:
     std::atomic<bool> offboard_ready_{false};
     std::atomic<double> airborne_since_s_{0.0}; // now().seconds() when Offboard was entered
     std::atomic<int> last_logged_flight_mode_{-1}; // -1: nothing logged yet
+    std::atomic<bool> last_logged_armed_{false};
+    std::atomic<int> last_logged_landed_state_{-1};
     std::atomic<int> current_flight_mode_{-1}; // mavsdk::Telemetry::FlightMode, cast to int
     int offboard_failure_count_ = 0;
     int close_encounter_ticks_ = 0; // consecutive ticks with a peer inside SAFE_DIST_M
@@ -974,6 +1014,8 @@ private:
     // Written by the MAVSDK telemetry thread, read by the ROS timer thread.
     std::atomic<double> my_x_{0}, my_y_{0}, my_z_{0};
     std::atomic<double> my_vx_{0}, my_vy_{0}, my_vz_{0};
+    // Diagnostic-only (freefall investigation): real attitude, degrees.
+    std::atomic<double> my_roll_deg_{0}, my_pitch_deg_{0};
 };
 
 int main(int argc, char** argv) {
