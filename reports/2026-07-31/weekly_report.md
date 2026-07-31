@@ -1,6 +1,22 @@
-# Session Report — 2026-07-31
+# Weekly Report — Week of 2026-07-27 to 2026-07-31
 
-## What was done today
+## Earlier this week (2026-07-26)
+
+- First real PX4 flight: `swarm_node` connects over MAVSDK, arms, takes off,
+  and flies the triangle formation with live collision avoidance instead of
+  fake position parameters.
+- Root-caused and fixed the main collision/drift chain found in live testing:
+  a "ghost leader" broadcasting a reference path before actually reaching
+  Offboard, a missing damping term causing oscillation, altitude being
+  starved by a combined horizontal/vertical speed clamp, and an RPATH
+  build issue.
+- Attempted a "chronic proximity" escape mode for the collision rule and
+  measured it honestly — the chronic-tick counter never actually fired in
+  testing, so the improvement seen was most likely sample noise, not a real
+  fix. Sent the investigation back to first principles rather than keeping
+  an unproven change.
+
+## This week's main session (2026-07-31)
 
 - Validated the two automated test suites end to end on the native macOS
   (RoboStack) path:
@@ -39,8 +55,7 @@
 
 ## Known issue: takeoff is not always clean
 
-Two separate problems showed up around takeoff during today's session, both
-reproducible:
+Two separate problems showed up around takeoff this week, both reproducible:
 
 1. **Arming denied on the first attempt after a previous landing.** Relaunching
    the ROS 2 nodes right after an RTL sometimes fails to arm
@@ -57,7 +72,7 @@ reproducible:
    and lands the drone safely every time it's been observed, but the root
    cause of the physical near-miss itself is still open.
 
-**I'll pick this up this week to find out exactly where the takeoff problem is
+**I'll pick this up next week to find out exactly where the takeoff problem is
 coming from** — likely candidates to check first: spawn spacing in
 `worlds/swarm_persistent.sdf`, and whether `TAKEOFF_SPEED_CAP_M_S` /
 `TAKEOFF_SPEED_RAMP_S` are actually being tight enough for the first couple of
