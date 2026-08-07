@@ -5,6 +5,19 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# macOS only: CMake's Python3 detection defaults to searching Frameworks
+# before PATH. Homebrew's python@3.14 framework on this machine has a
+# broken pyexpat (incompatible with the system libexpat.1.dylib -- "Symbol
+# not found: _XML_SetAllocTrackerActivationThreshold"), which crashes cmake
+# configure the moment ament's build-time tooling (package_xml_2_cmake.py,
+# invoked by rosidl_generate_interfaces below) tries to run a Python script.
+# Force PATH-first detection so it picks up the ROS/conda toolchain's own
+# Python instead.
+if(APPLE)
+  set(Python3_FIND_FRAMEWORK LAST CACHE STRING "" FORCE)
+  set(Python3_FIND_STRATEGY LOCATION CACHE STRING "" FORCE)
+endif()
+
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)

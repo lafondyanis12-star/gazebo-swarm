@@ -101,12 +101,12 @@
     <include>
       <uri>file:///Users/lafondyanis/PX4-Autopilot/Tools/simulation/gz/models/x500/model.sdf</uri>
       <name>x500_1</name>
-      <pose>2 0 0 0 0 0</pose>
+      <pose>4 0 0 0 0 0</pose>
     </include>
     <include>
       <uri>file:///Users/lafondyanis/PX4-Autopilot/Tools/simulation/gz/models/x500/model.sdf</uri>
       <name>x500_2</name>
-      <pose>4 0 0 0 0 0</pose>
+      <pose>8 0 0 0 0 0</pose>
     </include>
   </world>
 </sdf>

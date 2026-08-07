@@ -5,10 +5,18 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# macOS only: see swarm_msgs/CMakeLists.txt for why -- same Homebrew-Python
+# vs. ament-tooling conflict applies here too.
+if(APPLE)
+  set(Python3_FIND_FRAMEWORK LAST CACHE STRING "" FORCE)
+  set(Python3_FIND_STRATEGY LOCATION CACHE STRING "" FORCE)
+endif()
+
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(swarm_msgs REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Development)
 
 # Explicit RPATH to swarm_msgs' installed lib dir: on macOS, dyld does not
 # consistently pick up DYLD_LIBRARY_PATH (set by install/setup.zsh) through
@@ -30,6 +38,19 @@ find_package(MAVSDK REQUIRED)
 add_executable(swarm_node src/swarm_node.cpp)
 ament_target_dependencies(swarm_node rclcpp swarm_msgs)
 target_link_libraries(swarm_node MAVSDK::mavsdk)
+
+# swarm_msgs exports its rosidl_generator_py library (Python message
+# bindings) as part of the same dependency set ament_target_dependencies
+# links above -- needed by swarm_dashboard.py / simulate_triangle_flight.py,
+# irrelevant to this C++ node. On macOS that .dylib's Python C-API symbols
+# (e.g. _PyBool_Type) are built as flat-namespace "resolve from whatever
+# process loads me" references, which only works inside an actual Python
+# interpreter process. swarm_node isn't one, so loading it crashes at
+# startup with "symbol not found in flat namespace '_PyBool_Type'" -- fixed
+# by also loading the matching libpython into this process so dyld's flat
+# namespace search has somewhere to find those symbols, even though
+# swarm_node itself never calls into Python.
+target_link_libraries(swarm_node Python3::Python)
 
 install(TARGETS
   swarm_node

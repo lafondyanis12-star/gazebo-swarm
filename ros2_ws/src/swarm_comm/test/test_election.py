@@ -4,6 +4,7 @@
 #
 # ros2 launch_test src/swarm_comm/test/test_election.py  (or via colcon test)
 
+import os
 import subprocess
 import time
 import unittest
@@ -12,6 +13,23 @@ import launch
 import launch_ros.actions
 import launch_testing.actions
 import pytest
+
+# colcon/ament's launch_testing (via ctest) strips DYLD_LIBRARY_PATH before
+# exec'ing this test process -- the same mechanism documented in
+# swarm_comm/CMakeLists.txt for swarm_node itself, but that fix (baked-in
+# RPATH) only covers swarm_node's own binary, not the `ros2` CLI subprocesses
+# spawned here. Without it, `ros2 topic echo`/`param set` can't dlopen
+# swarm_msgs' typesupport .dylib and fail immediately with "invalid
+# allocator" -- not a DDS discovery race, so retrying alone doesn't fix it.
+_INSTALL_LIB_DIRS = [
+    os.path.join(os.path.dirname(__file__), '..', '..', '..', 'install', pkg, 'lib')
+    for pkg in ('swarm_msgs', 'swarm_comm')
+]
+_ROS2_ENV = {
+    **os.environ,
+    'DYLD_LIBRARY_PATH': ':'.join(
+        [*_INSTALL_LIB_DIRS, os.environ.get('DYLD_LIBRARY_PATH', '')]),
+}
 
 
 @pytest.mark.launch_test
@@ -35,19 +53,29 @@ def generate_test_description():
 def set_x(drone_name, value):
     subprocess.run(
         ['ros2', 'param', 'set', f'/{drone_name}', 'x', str(value)],
-        check=True, capture_output=True,
+        check=True, capture_output=True, env=_ROS2_ENV,
     )
 
 
 def get_claimed_leader(drone_name):
-    out = subprocess.run(
-        ['ros2', 'topic', 'echo', '--once', f'/{drone_name}/swarm_status'],
-        check=True, capture_output=True, text=True, timeout=10,
-    ).stdout
-    for line in out.splitlines():
-        if line.startswith('claimed_leader:'):
-            return int(line.split(':')[1].strip())
-    raise RuntimeError(f'no claimed_leader in output from {drone_name}: {out!r}')
+    # Retry with a short discovery grace period -- `ros2 topic echo --once`
+    # can still fail if DDS discovery hasn't found the publisher yet, flaky
+    # under heavy system load (see README "What's left").
+    last_err = None
+    for _ in range(5):
+        try:
+            out = subprocess.run(
+                ['ros2', 'topic', 'echo', '--once', f'/{drone_name}/swarm_status'],
+                check=True, capture_output=True, text=True, timeout=10, env=_ROS2_ENV,
+            ).stdout
+            for line in out.splitlines():
+                if line.startswith('claimed_leader:'):
+                    return int(line.split(':')[1].strip())
+            raise RuntimeError(f'no claimed_leader in output from {drone_name}: {out!r}')
+        except subprocess.CalledProcessError as err:
+            last_err = err
+            time.sleep(1)
+    raise last_err
 
 
 class TestSwarmElection(unittest.TestCase):

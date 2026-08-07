@@ -71,7 +71,7 @@ constexpr int PX4_BASE_PORT = 14540;  // instance i: MAVSDK connects to udpin://
 // Spawn offsets from worlds/swarm_persistent.sdf (world-ENU: x=East,
 // y=North). Only needed to translate each vehicle's own-origin local NED
 // into the shared world frame -- see file header.
-constexpr double SPAWN_EAST_M[MAX_DRONES] = {0.0, 2.0, 4.0};
+constexpr double SPAWN_EAST_M[MAX_DRONES] = {0.0, 4.0, 8.0};
 constexpr double SPAWN_NORTH_M[MAX_DRONES] = {0.0, 0.0, 0.0};
 
 constexpr double TAKEOFF_WAIT_ALT_M = 1.5;   // consider "airborne" past this altitude
@@ -105,20 +105,33 @@ constexpr double SEEK_KD = 0.6;
 
 // Formation-seeking (not repulsion -- see below) is speed-capped for this
 // long right after becoming airborne, ramping linearly from
-// TAKEOFF_SPEED_CAP_M_S up to the normal MAX_SPEED_M_S. All 3 drones spawn
-// only 2m apart and every one of them independently converges on its
-// formation slot the instant it's airborne -- at full MAX_SPEED_M_S closing
-// speed on each side, a live test traced pairs closing to 0.18-0.29m (very
-// likely an actual airframe collision in Gazebo, not just a logical
-// proximity warning -- see separation_repulsion()'s comment) within about
-// two 10Hz control ticks of entering the repulsion margin, faster than the
-// control loop or a stronger repulsion ramp could react to. Slowing the
-// deliberate, known-hazardous first few seconds gives both the loop and
-// repulsion time to actually work. Repulsion itself is deliberately exempt
-// -- it keeps full authority throughout, so an actual close encounter still
-// gets maximum escape speed even during the slow-start window.
+// TAKEOFF_SPEED_CAP_M_S up to the normal MAX_SPEED_M_S. Every drone
+// independently converges on its formation slot the instant it's airborne
+// -- at full MAX_SPEED_M_S closing speed on each side, a live test traced
+// pairs closing to 0.18-0.29m (very likely an actual airframe collision in
+// Gazebo, not just a logical proximity warning -- see
+// separation_repulsion()'s comment) within about two 10Hz control ticks of
+// entering the repulsion margin, faster than the control loop or a stronger
+// repulsion ramp could react to. Slowing the deliberate, known-hazardous
+// first few seconds gives both the loop and repulsion time to actually
+// work. Repulsion itself is deliberately exempt -- it keeps full authority
+// throughout, so an actual close encounter still gets maximum escape speed
+// even during the slow-start window. Spawn spacing was also widened 2m ->
+// 4m (see SPAWN_EAST_M / worlds/swarm_persistent.sdf) after this alone
+// wasn't enough to stop near-collisions -- untested whether it's sufficient
+// on its own.
 constexpr double TAKEOFF_SPEED_CAP_M_S = 1.0;
 constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;
+
+// Finite "there and back" mission instead of an indefinite loiter/line loop:
+// every drone flies its role (scripted leader path, or formation-following)
+// for this long after becoming airborne, then independently breaks off --
+// leader and followers alike -- and seeks its own spawn position directly
+// (no more formation offset), landing once it arrives. Each drone times
+// this off its own airborne_since_s_, so no extra coordination/messaging is
+// needed for the whole swarm to head home at roughly the same time.
+constexpr double MISSION_OUTBOUND_S = 40.0;
+constexpr double HOME_ARRIVAL_RADIUS_M = 0.5; // horizontal distance from spawn to trigger landing
 
 constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between any 2 drones
 
@@ -437,6 +450,20 @@ public:
         RCLCPP_INFO(get_logger(), "[%s] Starting. Connecting to PX4 on udp %d...",
                     my_name_.c_str(), PX4_BASE_PORT + my_id_);
         std::thread(&SwarmNode::connect_and_fly, this).detach();
+
+        // Demo/orchestration convenience: a clean SIGINT (ros2 launch's own
+        // Ctrl-C handling, which calls rclcpp::shutdown() before this runs --
+        // not a raw OS signal handler, so it's safe to make a blocking MAVSDK
+        // call here) commands RTL instead of just dropping the offboard link
+        // and leaving PX4 to its own failsafe. No effect if flight never
+        // reached Offboard (action_ still null).
+        rclcpp::on_shutdown([this]() {
+            if (action_) {
+                RCLCPP_INFO(get_logger(), "[%s] Shutdown requested -- returning to launch.",
+                            my_name_.c_str());
+                action_->return_to_launch();
+            }
+        });
     }
 
 private:
@@ -670,6 +697,13 @@ private:
             if (action_) action_->land();
             return;
         }
+        if (returning_home() &&
+            std::hypot(my_pos.x - SPAWN_EAST_M[my_id_], my_pos.y - SPAWN_NORTH_M[my_id_]) < HOME_ARRIVAL_RADIUS_M) {
+            RCLCPP_INFO(get_logger(), "[%s] Back at spawn position -- landing.", my_name_.c_str());
+            offboard_ready_.store(false);
+            if (action_) action_->land();
+            return;
+        }
 
         Vec3 desired = compute_role_velocity(my_pos, my_vel);
         // Speed-cap formation-seeking only (not repulsion, computed below with its
@@ -773,10 +807,21 @@ private:
         }
     }
 
+    // Past MISSION_OUTBOUND_S airborne: every drone heads home on its own,
+    // regardless of role -- see MISSION_OUTBOUND_S's comment.
+    bool returning_home() const {
+        return now().seconds() - airborne_since_s_.load() > MISSION_OUTBOUND_S;
+    }
+
     // Leader: pursue the scripted loiter reference (feedforward + feedback).
     // Follower: hold a triangle-formation offset on the live leader.
     // Neither role known yet, or leader's position not seen yet: hover.
+    // Past MISSION_OUTBOUND_S: role/formation ignored, straight home instead.
     Vec3 compute_role_velocity(const Vec3& my_pos, const Vec3& my_vel) {
+        if (returning_home()) {
+            Vec3 home{SPAWN_EAST_M[my_id_], SPAWN_NORTH_M[my_id_], LOITER_ALT_M};
+            return seek_velocity(home, my_pos, my_vel, Vec3{});
+        }
         if (leader_id_ == my_id_) {
             auto ref = flight_pattern_ == "line"
                 ? line_reference(now().seconds(), line_phase_offset_)
