@@ -135,6 +135,32 @@ constexpr double HOME_ARRIVAL_RADIUS_M = 0.5; // horizontal distance from spawn 
 
 constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between any 2 drones
 
+// On-demand "fly away and come back" excursion (triggered via `ros2 param
+// set /drone_N excursion true`), for demoing the radio-range disconnect/
+// reconnect path without the previous approach's problem: forcing an
+// instant `gz set_pose` teleport on the physical vehicle. A teleport jumps
+// position with no matching velocity, which the physics engine and PX4's
+// EKF were never designed to absorb -- see MIN_ALT_HARD_M's comment thread
+// for the resulting attitude-upset/freefall investigation, concluded as a
+// Gazebo/PX4 SITL issue outside what this control loop can fix. Flying the
+// same distance under normal Offboard velocity control instead never
+// produces that discontinuity: same disconnect/re-election/reconnect
+// behavior at the swarm-comm level (still driven purely by real distance
+// vs. MAX_RANGE_M in on_peer_status()), reached by a continuous, physically
+// ordinary flight path instead of a jump.
+constexpr double EXCURSION_DURATION_S = 10.0;
+// Clear of MAX_RANGE_M (10m) so the excursion reliably reads as a real
+// disconnect to peers, comfortably inside GEOFENCE_RADIUS_M (30m).
+constexpr double EXCURSION_DISTANCE_M = 15.0;
+// Same speed-ramp idea as TAKEOFF_SPEED_RAMP_S, applied at excursion start: without it,
+// the position gap to a target 15m away saturates clamp_speed() immediately, snapping from
+// whatever formation-seeking velocity was commanded the tick before straight to
+// MAX_SPEED_M_S in one step. Ramping from TAKEOFF_SPEED_CAP_M_S over this many seconds
+// gives a smooth departure instead of that step. The return leg needs no equivalent ramp:
+// by the time it happens, the same distance gap drives normal formation-seeking, which
+// already ramps down smoothly via seek_velocity's own P(D) term as the gap closes.
+constexpr double EXCURSION_RAMP_S = 2.0;
+
 // Repulsion starts ramping at this distance, well before SAFE_DIST_M --
 // anticipatory rather than purely reactive. Chosen below the formation's
 // own normal spacing (~1.8m leader-follower, ~2.0m follower-follower, see
@@ -423,6 +449,11 @@ public:
         declare_parameter<double>("x", 0.0);
         declare_parameter<double>("y", 0.0);
         declare_parameter<double>("z", 0.0);
+        // Excursion trigger -- see EXCURSION_DURATION_S's comment. Edge-triggered on each
+        // `true` set while not already mid-excursion, so it can be re-armed by setting it
+        // true again after a previous excursion completes (excursion_active_ resets to
+        // false on its own in control_step(), independent of this parameter's stored value).
+        declare_parameter<bool>("excursion", false);
         // Which scripted path the leader flies: "loiter" (circular, default)
         // or "line" (straight back-and-forth). Read once at startup --
         // whoever holds leadership when this is checked flies that pattern;
@@ -437,6 +468,17 @@ public:
                     if (p.get_name() == "x") my_x_.store(p.as_double());
                     else if (p.get_name() == "y") my_y_.store(p.as_double());
                     else if (p.get_name() == "z") my_z_.store(p.as_double());
+                    else if (p.get_name() == "excursion" && p.as_bool() && !excursion_active_) {
+                        excursion_active_ = true;
+                        excursion_started_s_ = now().seconds();
+                        excursion_until_s_ = excursion_started_s_ + EXCURSION_DURATION_S;
+                        Vec3 my_pos{my_x_.load(), my_y_.load(), my_z_.load()};
+                        excursion_target_ = Vec3{my_pos.x, my_pos.y - EXCURSION_DISTANCE_M, my_pos.z};
+                        RCLCPP_INFO(get_logger(),
+                            "[%s] Excursion started -- heading to (%.1f, %.1f, %.1f) for %.0fs.",
+                            my_name_.c_str(), excursion_target_.x, excursion_target_.y,
+                            excursion_target_.z, EXCURSION_DURATION_S);
+                    }
                 }
                 rcl_interfaces::msg::SetParametersResult result;
                 result.successful = true;
@@ -638,6 +680,7 @@ private:
     // --- 10Hz loop: publish real telemetry, and (once airborne) send the
     // role-appropriate Offboard velocity setpoint. ---
     void control_step() {
+        double now_s = now().seconds();
         Vec3 my_pos{my_x_.load(), my_y_.load(), my_z_.load()};
         Vec3 my_vel{my_vx_.load(), my_vy_.load(), my_vz_.load()};
 
@@ -646,7 +689,7 @@ private:
         msg.claimed_leader = leader_id_;
         msg.x = my_pos.x; msg.y = my_pos.y; msg.z = my_pos.z;
         msg.vx = my_vel.x; msg.vy = my_vel.y; msg.vz = my_vel.z;
-        msg.timestamp = now().seconds();
+        msg.timestamp = now_s;
         for (auto& [id, tracker] : trackers_) msg.peer_connected[id] = tracker.connected;
         msg.ready = offboard_ready_.load();
         // Only publish a reference velocity once actually flying it -- a drone that has
@@ -657,14 +700,20 @@ private:
         // caused a follower to do.
         if (leader_id_ == my_id_ && offboard_ready_.load()) {
             auto ref = flight_pattern_ == "line"
-                ? line_reference(now().seconds(), line_phase_offset_)
-                : loiter_reference(now().seconds(), loiter_phase_offset_);
+                ? line_reference(now_s, line_phase_offset_)
+                : loiter_reference(now_s, loiter_phase_offset_);
             msg.ref_vx = ref.vel.x;
             msg.ref_vy = ref.vel.y;
         }
         pub_->publish(msg);
 
         if (!offboard_ready_.load()) return;
+
+        if (excursion_active_ && now_s > excursion_until_s_) {
+            excursion_active_ = false;
+            RCLCPP_INFO(get_logger(), "[%s] Excursion complete -- resuming formation.",
+                        my_name_.c_str());
+        }
 
         if (my_pos.z > MAX_ALT_HARD_M) {
             // Hard backstop on actual altitude, independent of and in
@@ -706,15 +755,25 @@ private:
         }
 
         Vec3 desired = compute_role_velocity(my_pos, my_vel);
-        // Speed-cap formation-seeking only (not repulsion, computed below with its
-        // own full-strength authority) for a few seconds after becoming airborne --
-        // see TAKEOFF_SPEED_RAMP_S's comment for why.
-        double airborne_elapsed_s = now().seconds() - airborne_since_s_.load();
-        double takeoff_speed_cap = airborne_elapsed_s < TAKEOFF_SPEED_RAMP_S
+        // Speed-cap formation-seeking only (not repulsion, computed below with its own
+        // full-strength authority), ramping up from TAKEOFF_SPEED_CAP_M_S right after
+        // becoming airborne (see TAKEOFF_SPEED_RAMP_S) and again right after an excursion
+        // starts (see EXCURSION_RAMP_S) -- whichever ramp is still active wins, since both
+        // exist to smooth out the same kind of sudden-large-position-gap step.
+        double airborne_elapsed_s = now_s - airborne_since_s_.load();
+        double speed_cap = airborne_elapsed_s < TAKEOFF_SPEED_RAMP_S
             ? TAKEOFF_SPEED_CAP_M_S +
                   (MAX_SPEED_M_S - TAKEOFF_SPEED_CAP_M_S) * (airborne_elapsed_s / TAKEOFF_SPEED_RAMP_S)
             : MAX_SPEED_M_S;
-        desired = clamp_speed(desired, takeoff_speed_cap);
+        if (excursion_active_) {
+            double excursion_elapsed_s = now_s - excursion_started_s_;
+            double excursion_speed_cap = excursion_elapsed_s < EXCURSION_RAMP_S
+                ? TAKEOFF_SPEED_CAP_M_S +
+                      (MAX_SPEED_M_S - TAKEOFF_SPEED_CAP_M_S) * (excursion_elapsed_s / EXCURSION_RAMP_S)
+                : MAX_SPEED_M_S;
+            speed_cap = std::min(speed_cap, excursion_speed_cap);
+        }
+        desired = clamp_speed(desired, speed_cap);
         std::vector<Vec3> peer_positions;
         for (auto& [id, tracker] : trackers_) {
             if (tracker.connected) peer_positions.push_back(tracker.pos);
@@ -818,6 +877,13 @@ private:
     // Neither role known yet, or leader's position not seen yet: hover.
     // Past MISSION_OUTBOUND_S: role/formation ignored, straight home instead.
     Vec3 compute_role_velocity(const Vec3& my_pos, const Vec3& my_vel) {
+        if (excursion_active_) {
+            // Overrides role/formation entirely while active -- the point is to actually
+            // leave the formation, not seek it while also being pulled elsewhere. Hard
+            // safety backstops (altitude/geofence, checked earlier in control_step()) still
+            // apply unconditionally.
+            return seek_velocity(excursion_target_, my_pos, my_vel, Vec3{});
+        }
         if (returning_home()) {
             Vec3 home{SPAWN_EAST_M[my_id_], SPAWN_NORTH_M[my_id_], LOITER_ALT_M};
             return seek_velocity(home, my_pos, my_vel, Vec3{});
@@ -1055,6 +1121,13 @@ private:
     std::atomic<int> current_flight_mode_{-1}; // mavsdk::Telemetry::FlightMode, cast to int
     int offboard_failure_count_ = 0;
     int close_encounter_ticks_ = 0; // consecutive ticks with a peer inside SAFE_DIST_M
+    // Excursion state -- see EXCURSION_DURATION_S's comment. Only touched from the ROS
+    // executor thread (parameter callback + timers), same as leader_id_ etc., so plain
+    // members are fine here -- no atomics needed.
+    bool excursion_active_ = false;
+    double excursion_started_s_ = 0.0;
+    double excursion_until_s_ = 0.0;
+    Vec3 excursion_target_;
 
     // Written by the MAVSDK telemetry thread, read by the ROS timer thread.
     std::atomic<double> my_x_{0}, my_y_{0}, my_z_{0};
