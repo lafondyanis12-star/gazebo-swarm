@@ -1,6 +1,6 @@
-# Weekly Report — Week of 2026-08-03 to 2026-08-08
+# Weekly Report — This Week
 
-## 2026-08-07 — Takeoff collision fix + finite mission
+## Earlier this week — Takeoff collision fix + finite mission
 
 Closes the "takeoff is not always clean" issue flagged as next week's work in
 the previous report (`reports/2026-07-31/weekly_report.md`).
@@ -29,11 +29,11 @@ the previous report (`reports/2026-07-31/weekly_report.md`).
   RoboStack builds, and a shutdown handler that now sends RTL instead of just
   dropping the Offboard link.
 
-## 2026-08-08 (today) — Real flown excursion replaces the teleport-based disconnect demo
+## This week's main session — Real flown excursion replaces the teleport-based disconnect demo
 
 The existing demo procedure (`COMMANDES_DEMO.txt`) simulated a radio-range
 disconnect by teleporting a drone's physical pose in Gazebo (`gz service
-.../set_pose`). Re-running that demo today, live, produced exactly the
+.../set_pose`). Re-running that demo live produced exactly the
 failure mode the freefall investigation in `collision_avoidance.md` had
 already flagged as an open, unsolved issue: an instant position jump with no
 matching velocity is a discontinuity neither the physics engine nor PX4's EKF
