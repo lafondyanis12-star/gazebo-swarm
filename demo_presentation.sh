@@ -32,8 +32,32 @@ tell application "System Events"
 end tell
 EOF
 
-echo "Attente ~30s (demarrage PX4/Gazebo)..."
-sleep 30
+echo "Attente ~45s (demarrage PX4/Gazebo -- drone_1/drone_2 ont besoin de ce temps pour"
+echo "verrouiller leur position GPS avant que ROS2 essaie de s'y connecter, sinon ils"
+echo "timeout et ne decollent jamais -- voir COMMANDES_DEMO.txt)..."
+sleep 45
+
+echo "=== Verification que les 3 instances PX4 tournent bien ==="
+# PX4/Gazebo plante occasionnellement au demarrage (une instance qui echoue a
+# s'attacher a son modele Gazebo, en silence, sans crash bruyant) -- mieux
+# vaut le detecter maintenant et relancer tout de suite que de perdre 45s de
+# plus a attendre un timeout ROS2 pour le decouvrir.
+missing=0
+for i in 0 1 2; do
+  if ! pgrep -f "bin/px4 -i $i\$" > /dev/null; then
+    echo "  ERREUR : px4 -i $i n'est pas lance (plantage au demarrage)."
+    missing=1
+  fi
+done
+if [[ "$missing" == "1" ]]; then
+  echo ""
+  echo "Une ou plusieurs instances PX4 n'ont pas demarre. C'est un plantage"
+  echo "aleatoire connu de PX4/Gazebo au demarrage, pas un bug de ce script --"
+  echo "relance simplement ce script depuis le debut, ca repart generalement"
+  echo "du bon pied."
+  exit 1
+fi
+echo "Les 3 instances PX4 tournent."
 
 echo "=== 2/3 : ROS2 (communication + vol) ==="
 osascript <<'EOF'

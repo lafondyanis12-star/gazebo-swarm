@@ -130,7 +130,16 @@ constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;
 // (no more formation offset), landing once it arrives. Each drone times
 // this off its own airborne_since_s_, so no extra coordination/messaging is
 // needed for the whole swarm to head home at roughly the same time.
-constexpr double MISSION_OUTBOUND_S = 40.0;
+//
+// 300s (5 min), not the original 40s: 40s was fine for an unattended
+// automated test run, but live-testing demo_presentation.sh caught it
+// landing the whole swarm out from under a live presentation -- the
+// script's own ~40s of startup waits (PX4/Gazebo boot + node connect) ran
+// right up against the mission clock, so by the time it handed control
+// back the mission was already ending. 300s gives comfortable room to
+// actually narrate the formation and trigger the excursion demo before the
+// auto-return kicks in; RTL is still available on demand (Ctrl-C).
+constexpr double MISSION_OUTBOUND_S = 300.0;
 constexpr double HOME_ARRIVAL_RADIUS_M = 0.5; // horizontal distance from spawn to trigger landing
 
 constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between any 2 drones
