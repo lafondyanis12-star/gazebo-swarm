@@ -158,9 +158,28 @@ constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between an
 // vs. MAX_RANGE_M in on_peer_status()), reached by a continuous, physically
 // ordinary flight path instead of a jump.
 constexpr double EXCURSION_DURATION_S = 10.0;
-// Clear of MAX_RANGE_M (10m) so the excursion reliably reads as a real
-// disconnect to peers, comfortably inside GEOFENCE_RADIUS_M (30m).
-constexpr double EXCURSION_DISTANCE_M = 15.0;
+// Clear of MAX_RANGE_M (10m) so the excursion reads as a real disconnect to
+// peers, comfortably inside MAX_GEOFENCE_HARD_M (40m). Not just barely
+// clear: the target is a fixed offset from the excursing drone's own
+// position at trigger time, but the *peers* it needs to out-range keep
+// moving too (the leader's loiter reaches up to
+// LOITER_RADIUS_M*LOITER_OMEGA =~ 0.84 m/s).
+//
+// Honest result from repeated live trials: raising this from 15m to 20m to
+// 25m did NOT cleanly raise the odds of an actual disconnect -- roughly 1
+// run in 3 at each distance never dropped a peer at all (no "Signal lost"
+// line, nothing to see), no better at 25m than at 20m. That's a sign the
+// real culprit isn't distance margin at all: TIMEOUT_S (3s of silence
+// needed to declare a peer lost) can outlast a real-distance excursion if
+// the gap crosses back under MAX_RANGE_M even briefly before 3s of misses
+// accumulate -- distance alone can't fix a timing coincidence like that.
+// Left at 25m (no worse than 20m, and more margin against ordinary peer
+// motion is still a reasonable thing to want), but don't trust a single
+// trigger to reliably show a disconnect: if a live trigger doesn't print a
+// "Signal lost" line within a few seconds, just trigger it again
+// (`ros2 param set` is safe to repeat) -- worth fixing properly with more
+// time than a demo-eve pass allows.
+constexpr double EXCURSION_DISTANCE_M = 25.0;
 // Same speed-ramp idea as TAKEOFF_SPEED_RAMP_S, applied at excursion start: without it,
 // the position gap to a target 15m away saturates clamp_speed() immediately, snapping from
 // whatever formation-seeking velocity was commanded the tick before straight to
