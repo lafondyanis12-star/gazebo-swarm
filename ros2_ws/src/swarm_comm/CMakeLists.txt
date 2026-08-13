@@ -29,10 +29,15 @@ find_package(Python3 REQUIRED COMPONENTS Development)
 get_filename_component(SWARM_MSGS_LIB_DIR "${swarm_msgs_DIR}/../../../lib" ABSOLUTE)
 list(APPEND CMAKE_INSTALL_RPATH "${SWARM_MSGS_LIB_DIR}")
 
-# MAVSDK (real PX4 flight: Telemetry/Action/Offboard) -- installed via
-# `brew install mavsdk`, which doesn't drop its CMake config on the default
-# search path, so point CMake at the Homebrew prefix explicitly.
-list(APPEND CMAKE_PREFIX_PATH /opt/homebrew/opt/mavsdk)
+# MAVSDK (real PX4 flight: Telemetry/Action/Offboard). On macOS, `brew
+# install mavsdk` doesn't drop its CMake config on the default search path,
+# so point CMake at the Homebrew prefix explicitly. On Linux, building
+# MAVSDK from source with `cmake --install` (see MAVSDK's own docs) already
+# installs into /usr/local, which CMake searches by default -- no extra
+# prefix needed there.
+if(APPLE)
+  list(APPEND CMAKE_PREFIX_PATH /opt/homebrew/opt/mavsdk)
+endif()
 find_package(MAVSDK REQUIRED)
 
 add_executable(swarm_node src/swarm_node.cpp)

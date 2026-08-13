@@ -9,9 +9,17 @@ set -eo pipefail
 
 ID="${1:-1}"
 
-ROSENV="$HOME/micromamba/envs/ros_env"
-export PATH="$ROSENV/bin:$PATH"
-source "$ROSENV/setup.bash"
+# Prefer a native apt-installed ROS2 (standard on Linux); fall back to a
+# RoboStack/micromamba env (used on macOS, where ROS2 has no native package).
+if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+  source /opt/ros/jazzy/setup.bash
+elif [[ -f "$HOME/micromamba/envs/ros_env/setup.bash" ]]; then
+  export PATH="$HOME/micromamba/envs/ros_env/bin:$PATH"
+  source "$HOME/micromamba/envs/ros_env/setup.bash"
+else
+  echo "Aucun environnement ROS2 Jazzy trouve (ni /opt/ros/jazzy, ni ~/micromamba/envs/ros_env)." >&2
+  exit 1
+fi
 source "$HOME/Documents/my_project/gazebo_swarm/ros2_ws/install/setup.bash"
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 

@@ -6,7 +6,7 @@
 # flight recap: it just stays on screen once the flight is over.
 #
 # Run in a second terminal while the swarm is up:
-#   python3 tools/swarm_dashboard.py
+#   python3 tools/show_swarm_dashboard.py
 
 import math
 import sys

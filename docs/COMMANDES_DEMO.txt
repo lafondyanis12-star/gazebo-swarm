@@ -1,0 +1,43 @@
+=== ÉTAT ACTUEL ===
+Tout est déjà lancé et EN PAUSE : Gazebo + 3 PX4 + ROS2 (swarm_comm) + dashboard.
+Il suffit de cliquer sur le bouton PLAY (▶) dans la fenêtre Gazebo pour démarrer le vol.
+
+=== SI UN TERMINAL PLANTE / À RELANCER À LA MAIN ===
+
+--- Terminal 1 : Gazebo + PX4 ---
+cd ~/Documents/my_project/gazebo_swarm
+./run_swarm.sh
+
+--- Terminal 2 : Communication ROS2 (attendre ~45s après le terminal 1) ---
+cd ~/Documents/my_project/gazebo_swarm/ros2_ws
+bash -lc 'source /opt/ros/jazzy/setup.bash 2>/dev/null || { export PATH="$HOME/micromamba/envs/ros_env/bin:$PATH" && source "$HOME/micromamba/envs/ros_env/setup.bash"; }; source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && ros2 launch swarm_comm swarm_launch.py'
+
+--- Terminal 3 : Dashboard live ---
+cd ~/Documents/my_project/gazebo_swarm/ros2_ws
+bash -lc 'source /opt/ros/jazzy/setup.bash 2>/dev/null || { export PATH="$HOME/micromamba/envs/ros_env/bin:$PATH" && source "$HOME/micromamba/envs/ros_env/setup.bash"; }; source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && python3 tools/show_swarm_dashboard.py'
+
+NOTE : si "source setup.bash" échoue avec une erreur "setup.sh introuvable",
+c'est que le terminal est en zsh au lieu de bash — utiliser "bash -lc '...'"
+comme ci-dessus (déjà fait dans les commandes) plutôt que sourcer directement.
+
+=== SÉQUENCE DE DÉMO (une fois le vol stable, ~15-20s après PLAY) ===
+
+1. Laisser voler quelques secondes (triangle qui suit le leader).
+
+2. Déconnexion de drone_0 (perte de portée radio simulée) :
+gz service -s /world/swarm_persistent/set_pose --reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --timeout 3000 --req "name: 'x500_0', position: {x: 2, y: -26, z: 3}"
+
+3. Laisser drone_0 revenir tout seul (rien à faire, reconnexion automatique).
+
+4. Fin de démo — atterrissage / retour au point de départ (RTL) :
+for p in $(ps aux | grep "swarm_comm/swarm_node" | grep -v grep | awk '{print $2}'); do kill -SIGINT "$p"; done
+
+=== SI L'ARMEMENT ÉCHOUE AU 1ER ESSAI ("Arming denied") ===
+pkill -f "swarm_comm/swarm_node"
+puis relancer la commande du Terminal 2 ci-dessus.
+
+=== PLAN B (sans Gazebo/PX4, si problème le jour J) ===
+cd ~/Documents/my_project/gazebo_swarm/ros2_ws
+bash -lc 'source /opt/ros/jazzy/setup.bash 2>/dev/null || { export PATH="$HOME/micromamba/envs/ros_env/bin:$PATH" && source "$HOME/micromamba/envs/ros_env/setup.bash"; }; source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && ros2 launch swarm_comm swarm_launch.py'
+puis dans un 2e terminal :
+bash -lc 'source /opt/ros/jazzy/setup.bash 2>/dev/null || { export PATH="$HOME/micromamba/envs/ros_env/bin:$PATH" && source "$HOME/micromamba/envs/ros_env/setup.bash"; }; source install/setup.bash && python3 tools/simulate_triangle_flight.py'

@@ -1,12 +1,47 @@
 #!/usr/bin/env bash
 # One-command launch for the professor demo: cleans up any leftover
 # processes from a previous run, then opens the 3 terminal windows in
-# order (Gazebo/PX4, ROS2 comm, live dashboard), positioned on the
-# extended/Sidecar display. Prints the command to trigger the live
-# disconnect/reconnect demo once the formation looks stable.
+# order (Gazebo/PX4, ROS2 comm, live dashboard). Prints the command to
+# trigger the live disconnect/reconnect demo once the formation looks
+# stable.
 set -euo pipefail
 
 DIR="$HOME/Documents/my_project/gazebo_swarm"
+
+# Opens $1 (a shell command) in a new, visible terminal window. Tries the
+# common Linux terminal emulators in turn (whichever is installed wins);
+# falls back to macOS's Terminal.app via osascript. No window positioning --
+# unlike a single known Mac+Sidecar layout, an arbitrary Linux desktop's
+# monitor setup isn't something this script can assume.
+open_terminal() {
+  local cmd="$1"
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal -- bash -c "$cmd; exec bash"
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -e bash -c "$cmd; exec bash" &
+  elif command -v konsole >/dev/null 2>&1; then
+    konsole -e bash -c "$cmd; exec bash" &
+  elif command -v xterm >/dev/null 2>&1; then
+    xterm -hold -e bash -c "$cmd" &
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "tell application \"Terminal\" to do script \"$cmd\""
+  else
+    echo "Aucun emulateur de terminal trouve (gnome-terminal/x-terminal-emulator/konsole/xterm) -- lance a la main :" >&2
+    echo "  $cmd" >&2
+    return 1
+  fi
+}
+
+# Prefer a native apt-installed ROS2 (standard on Linux); fall back to a
+# RoboStack/micromamba env (used on macOS, where ROS2 has no native package).
+if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+  ROS_ACTIVATE="source /opt/ros/jazzy/setup.bash"
+elif [[ -f "$HOME/micromamba/envs/ros_env/setup.bash" ]]; then
+  ROS_ACTIVATE="export PATH=\"$HOME/micromamba/envs/ros_env/bin:\$PATH\" && source \"$HOME/micromamba/envs/ros_env/setup.bash\""
+else
+  echo "Aucun environnement ROS2 Jazzy trouve (ni /opt/ros/jazzy, ni ~/micromamba/envs/ros_env)." >&2
+  exit 1
+fi
 
 echo "=== Nettoyage d'une eventuelle simulation precedente ==="
 pkill -f "swarm_comm/swarm_node" 2>/dev/null || true
@@ -18,19 +53,7 @@ pkill -f "gz sim" 2>/dev/null || true
 sleep 2
 
 echo "=== 1/3 : Gazebo + PX4 ==="
-osascript <<'EOF'
-tell application "Terminal"
-  activate
-  do script "cd ~/Documents/my_project/gazebo_swarm && ./run_swarm.sh"
-end tell
-delay 0.5
-tell application "System Events"
-  tell process "Terminal"
-    set position of window 1 to {1512, 40}
-    set size of window 1 to {868, 650}
-  end tell
-end tell
-EOF
+open_terminal "cd '$DIR' && ./run_swarm.sh"
 
 echo "Attente ~45s (demarrage PX4/Gazebo -- drone_1/drone_2 ont besoin de ce temps pour"
 echo "verrouiller leur position GPS avant que ROS2 essaie de s'y connecter, sinon ils"
@@ -60,37 +83,13 @@ fi
 echo "Les 3 instances PX4 tournent."
 
 echo "=== 2/3 : ROS2 (communication + vol) ==="
-osascript <<'EOF'
-tell application "Terminal"
-  activate
-  do script "cd ~/Documents/my_project/gazebo_swarm/ros2_ws && bash -lc 'ROSENV=~/micromamba/envs/ros_env && export PATH=\"$ROSENV/bin:$PATH\" && source \"$ROSENV/setup.bash\" && source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && ros2 launch swarm_comm swarm_launch.py'"
-end tell
-delay 0.5
-tell application "System Events"
-  tell process "Terminal"
-    set position of window 1 to {2380, 40}
-    set size of window 1 to {420, 314}
-  end tell
-end tell
-EOF
+open_terminal "cd '$DIR/ros2_ws' && $ROS_ACTIVATE && source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && ros2 launch swarm_comm swarm_launch.py"
 
 echo "Attente ~10s (connexion des noeuds a PX4)..."
 sleep 10
 
 echo "=== 3/3 : Dashboard live ==="
-osascript <<'EOF'
-tell application "Terminal"
-  activate
-  do script "cd ~/Documents/my_project/gazebo_swarm/ros2_ws && bash -lc 'ROSENV=~/micromamba/envs/ros_env && export PATH=\"$ROSENV/bin:$PATH\" && source \"$ROSENV/setup.bash\" && source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && python3 tools/swarm_dashboard.py'"
-end tell
-delay 0.5
-tell application "System Events"
-  tell process "Terminal"
-    set position of window 1 to {1512, 716}
-    set size of window 1 to {1288, 296}
-  end tell
-end tell
-EOF
+open_terminal "cd '$DIR/ros2_ws' && $ROS_ACTIVATE && source install/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && python3 tools/show_swarm_dashboard.py"
 
 echo ""
 echo "=== Tout est lance ==="
