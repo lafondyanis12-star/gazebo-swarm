@@ -1,0 +1,64 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/dji/mavic/protos/Mavic2Pro.proto"
+
+WorldInfo {
+}
+Viewpoint {
+  orientation -0.5766241330112656 0.5759048288047441 0.5795155195405768 2.092232083253712
+  position -0.0003707663513068872 -0.09296590449275667 16.554350075256067
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+}
+Mavic2Pro {
+  translation 0 0 0.1
+  name "drone_0"
+  controller "Swarm_controller"
+  bodySlot [
+    Group {
+      children [
+        Receiver {
+        }
+        Emitter {
+        }
+      ]
+    }
+  ]
+}
+Mavic2Pro {
+  translation -1.5 1.5 1
+  name "drone_1"
+  controller "Swarm_controller"
+  bodySlot [
+    Group {
+      children [
+        Receiver {
+        }
+        Emitter {
+        }
+      ]
+    }
+  ]
+}
+Mavic2Pro {
+  translation -1.5 -1.5 0.1
+  name "drone_2"
+  controller "Swarm_controller"
+  bodySlot [
+    Group {
+      children [
+        Receiver {
+        }
+        Emitter {
+        }
+      ]
+    }
+  ]
+}
