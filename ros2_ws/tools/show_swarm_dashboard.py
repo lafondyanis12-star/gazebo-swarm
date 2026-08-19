@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# Simplified dashboard: each drone's position, who it thinks the leader is,
-# and connected/not connected per peer -- nothing else. Minimum distance
-# between any 2 drones (collision risk) is shown at the bottom, in meters.
-# A running event log (leader changes, connect/disconnect) doubles as a
-# flight recap: it just stays on screen once the flight is over.
+# Tableau de bord simplifie de l'essaim : affiche en continu, pour chaque
+# drone, sa position, le leader qu'il croit avoir, et l'etat connecte/
+# deconnecte de chaque pair -- rien d'autre. La distance minimale entre 2
+# drones quelconques (risque de collision) est affichee en bas, en metres.
+# Un journal d'evenements (changements de leader, connexion/deconnexion)
+# fait aussi office de recap de vol : il reste affiche une fois le vol
+# termine.
 #
-# Run in a second terminal while the swarm is up:
+# A lancer dans un 2e terminal pendant que l'essaim tourne :
 #   python3 tools/show_swarm_dashboard.py
 
 import math
@@ -17,7 +19,7 @@ from rclpy.node import Node
 from swarm_msgs.msg import SwarmStatus
 
 NUM_DRONES = 3
-SAFE_DIST_M = 1.0  # must match SAFE_DIST_M in swarm_node.cpp
+SAFE_DIST_M = 1.0  # doit correspondre a SAFE_DIST_M dans swarm_node.cpp
 REFRESH_S = 0.3
 MAX_EVENTS = 14
 
@@ -28,19 +30,23 @@ RESET = '\x1b[0m'
 
 
 class DroneRow:
+    """Derniere valeur connue (etat affiche) pour un drone du tableau de bord."""
 
     def __init__(self):
         self.x = self.y = self.z = 0.0
         self.claimed_leader = -1
         self.peer_connected = [False] * NUM_DRONES
-        self.has_data = False
+        self.has_data = False  # True des qu'un premier message a ete recu
 
 
 def distance(a, b):
+    """Distance euclidienne 3D entre deux DroneRow."""
     return math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
 
 
 class SwarmDashboard(Node):
+    """Noeud ROS2 qui s'abonne au /swarm_status de chaque drone et affiche
+    un tableau de bord texte (rafraichi periodiquement) dans le terminal."""
 
     def __init__(self):
         super().__init__('swarm_dashboard')
@@ -54,15 +60,23 @@ class SwarmDashboard(Node):
         self.create_timer(REFRESH_S, self._render)
 
     def _log_event(self, text):
+        """Ajoute un evenement horodate au journal, en ne gardant que les MAX_EVENTS derniers."""
         elapsed = time.monotonic() - self.start_time
         self.events.append((elapsed, text))
         del self.events[:-MAX_EVENTS]
 
     def _make_callback(self, drone_id):
+        """Cree le callback d'abonnement /swarm_status pour drone_id (capture drone_id).
+
+        Detecte les changements (leader, connexions) par rapport a l'etat
+        precedent pour alimenter le journal d'evenements, puis met a jour
+        la ligne du tableau de bord correspondante.
+        """
         def callback(msg):
             row = self.rows[drone_id]
             row.x, row.y, row.z = msg.x, msg.y, msg.z
 
+            # Changement de leader percu par ce drone -> evenement journalise.
             if row.has_data and msg.claimed_leader != row.claimed_leader:
                 if msg.claimed_leader == drone_id:
                     self._log_event(f'drone_{drone_id} became LEADER')
@@ -70,6 +84,7 @@ class SwarmDashboard(Node):
                     self._log_event(f'drone_{drone_id} now follows drone_{msg.claimed_leader}')
             row.claimed_leader = msg.claimed_leader
 
+            # Changement de connectivite (par pair) -> evenement journalise.
             new_connected = list(msg.peer_connected)
             if row.has_data:
                 for j in range(NUM_DRONES):
@@ -82,8 +97,9 @@ class SwarmDashboard(Node):
         return callback
 
     def _render(self):
+        """Redessine tout l'ecran (appele periodiquement par le timer REFRESH_S)."""
         lines = [
-            '\x1b[H\x1b[J',  # clear screen, cursor home
+            '\x1b[H\x1b[J',  # efface l'ecran, curseur en haut a gauche
             f'{BOLD}SWARM DASHBOARD{RESET}  (ctrl-c to quit)',
             '',
         ]
@@ -110,6 +126,8 @@ class SwarmDashboard(Node):
                 lines.append(f'   -> drone_{j} : {status}')
             lines.append('')
 
+        # Distance minimale entre 2 drones parmi ceux ayant deja des donnees
+        # -- indicateur simple de risque de collision.
         live_rows = [self.rows[i] for i in range(NUM_DRONES) if self.rows[i].has_data]
         if len(live_rows) >= 2:
             pair_dists = [
@@ -134,6 +152,7 @@ class SwarmDashboard(Node):
 
 
 def main():
+    """Point d'entree : initialise ROS2, lance le tableau de bord jusqu'a ctrl-c."""
     rclpy.init()
     node = SwarmDashboard()
     try:

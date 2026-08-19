@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# One-command launch for the professor demo: cleans up any leftover
-# processes from a previous run, then opens the 3 terminal windows in
-# order (Gazebo/PX4, ROS2 comm, live dashboard). Prints the command to
-# trigger the live disconnect/reconnect demo once the formation looks
-# stable.
+# Lancement en une seule commande de la démo pour le professeur : nettoie
+# les process laissés par une exécution précédente, puis ouvre les 3
+# fenêtres de terminal dans l'ordre (Gazebo/PX4, communication ROS2,
+# dashboard en direct). Affiche ensuite la commande à lancer pour
+# déclencher la démo de déconnexion/reconnexion une fois la formation
+# stabilisée.
 set -euo pipefail
 
 DIR="$HOME/Documents/my_project/gazebo_swarm"
 
-# Opens $1 (a shell command) in a new, visible terminal window. Tries the
-# common Linux terminal emulators in turn (whichever is installed wins);
-# falls back to macOS's Terminal.app via osascript. No window positioning --
-# unlike a single known Mac+Sidecar layout, an arbitrary Linux desktop's
-# monitor setup isn't something this script can assume.
+# Ouvre $1 (une commande shell) dans une nouvelle fenêtre de terminal
+# visible. Essaie les émulateurs de terminal Linux courants l'un après
+# l'autre (le premier installé gagne) ; se rabat sur Terminal.app de macOS
+# via osascript. Pas de positionnement de fenêtre -- contrairement à une
+# disposition Mac+Sidecar connue à l'avance, la configuration d'écran d'un
+# poste Linux quelconque n'est pas quelque chose que ce script peut supposer.
 open_terminal() {
   local cmd="$1"
   if command -v gnome-terminal >/dev/null 2>&1; then
@@ -32,8 +34,9 @@ open_terminal() {
   fi
 }
 
-# Prefer a native apt-installed ROS2 (standard on Linux); fall back to a
-# RoboStack/micromamba env (used on macOS, where ROS2 has no native package).
+# Préfère un ROS2 installé nativement via apt (standard sous Linux) ;
+# sinon se rabat sur un environnement RoboStack/micromamba (utilisé sur
+# macOS, où ROS2 n'a pas de paquet natif).
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
   ROS_ACTIVATE="source /opt/ros/jazzy/setup.bash"
 elif [[ -f "$HOME/micromamba/envs/ros_env/setup.bash" ]]; then

@@ -26,6 +26,50 @@
 // ros2 run swarm_comm swarm_node --ros-args -p id:=0/1/2
 // (expects a PX4 SITL instance already up on udp 14540+id -- see
 // run_swarm.sh)
+//
+// ============================================================================
+// RÉSUMÉ EN FRANÇAIS -- rôle général de ce nœud ROS2
+// ============================================================================
+// Ce fichier est le nœud ROS2 principal ("swarm_node") exécuté par CHAQUE
+// drone de l'essaim (un exemplaire par drone, lancé avec un paramètre --id
+// différent : 0, 1 ou 2). Il fait à la fois :
+//
+//   1. Pilotage réel du drone : connexion à sa propre instance PX4 SITL via
+//      MAVSDK (bibliothèque de contrôle de drones), armement, décollage,
+//      puis passage en mode "Offboard" où ce nœud envoie 10 fois par
+//      seconde une consigne de vitesse (setpoint) au pilote automatique.
+//
+//   2. Communication inter-drones : chaque drone publie en continu son état
+//      (position, vitesse, qui il pense être le leader...) sur son propre
+//      topic ROS2 "/drone_<id>/swarm_status" (type SwarmStatus, un message
+//      personnalisé défini dans swarm_msgs), et s'abonne aux topics des
+//      autres drones pour connaître leur état. Une portée radio simulée
+//      (MAX_RANGE_M) limite la distance à laquelle deux drones peuvent
+//      encore "s'entendre" -- au-delà, un message est ignoré comme s'il
+//      n'avait jamais été reçu.
+//
+//   3. Élection de leader : à partir des messages reçus des pairs, chaque
+//      drone déduit qui est actuellement "en vie" (signal reçu récemment,
+//      avant expiration d'un délai TIMEOUT_S) et fait tourner un algorithme
+//      de vote majoritaire (voir elect_leader()) pour désigner un leader
+//      commun, de façon robuste aux déconnexions/reconnexions et aux
+//      changements de topologie du réseau simulé.
+//
+//   4. Gestion de formation : le drone leader suit une trajectoire scriptée
+//      (cercle de "loiter" ou aller-retour en ligne droite), et les drones
+//      suiveurs (followers) maintiennent une position relative en triangle
+//      derrière/à côté du leader, avec en plus une règle de séparation qui
+//      repousse deux drones qui se rapprochent trop l'un de l'autre
+//      (anticollision).
+//
+// Topics ROS2 publiés : "/drone_<id>/swarm_status" (SwarmStatus, 10 Hz).
+// Topics ROS2 souscrits : "/drone_<peer>/swarm_status" pour chaque autre
+// drone de l'essaim.
+// Paramètres ROS2 : "id" (obligatoire, numéro du drone), "x"/"y"/"z"
+// (position de secours pour tester sans PX4), "excursion" (déclenche une
+// sortie temporaire de la formation, pour démonstration), "flight_pattern"
+// ("loiter" ou "line", trajectoire du leader).
+// ============================================================================
 
 #include <rclcpp/rclcpp.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
@@ -55,27 +99,36 @@ using swarm_msgs::msg::SwarmStatus;
 
 namespace {
 
-constexpr int MAX_DRONES = 3;
-constexpr double TIMEOUT_S = 3.0;
+// --------------------------------------------------------------------------
+// Constantes de configuration de l'essaim (namespace anonyme = usage interne
+// à ce fichier uniquement). Regroupe les paramètres physiques, temporels et
+// de sécurité qui pilotent le comportement de communication/élection/
+// formation ci-dessous.
+// --------------------------------------------------------------------------
+
+constexpr int MAX_DRONES = 3;   // taille fixe de l'essaim (3 drones : id 0, 1, 2)
+constexpr double TIMEOUT_S = 3.0;  // silence radio (s) au-delà duquel un pair est déclaré "perdu"
 // Simulated radio range. Widened from an original 6m after live testing
 // showed the triangle formation's own footprint (~1.8-2m) leaves too
 // little slack at 6m: a follower doesn't need to drift far off-station
 // before a transient (a hard turn, a moment of separation-avoidance) pushes
 // a pair briefly past range and triggers an avoidable reconnect cycle.
 // 10m keeps that margin comfortably above the formation's normal spread.
-constexpr double MAX_RANGE_M = 10.0;
-constexpr int NO_LEADER = -1;
+constexpr double MAX_RANGE_M = 10.0;  // portée radio simulée (m) : au-delà, un message pair est ignoré
+constexpr int NO_LEADER = -1;  // valeur sentinelle : "aucun leader connu/élu"
 
 constexpr int PX4_BASE_PORT = 14540;  // instance i: MAVSDK connects to udpin://0.0.0.0:14540+i
+// -> chaque drone i se connecte à son propre PX4 SITL sur le port 14540+i.
 
-// Spawn offsets from worlds/swarm_persistent.sdf (world-ENU: x=East,
-// y=North). Only needed to translate each vehicle's own-origin local NED
-// into the shared world frame -- see file header.
+// Décalages de spawn (position de départ) tirés de worlds/swarm_persistent.sdf
+// (repère monde ENU : x=Est, y=Nord). Sert uniquement à convertir la position
+// locale NED de chaque véhicule (relative à son propre point de spawn) vers
+// le repère monde partagé -- voir la note "Frame" en en-tête du fichier.
 constexpr double SPAWN_EAST_M[MAX_DRONES] = {0.0, 4.0, 8.0};
 constexpr double SPAWN_NORTH_M[MAX_DRONES] = {0.0, 0.0, 0.0};
 
-constexpr double TAKEOFF_WAIT_ALT_M = 1.5;   // consider "airborne" past this altitude
-constexpr double CONTROL_PERIOD_S = 0.1;     // 10Hz: broadcast + Offboard setpoint stream
+constexpr double TAKEOFF_WAIT_ALT_M = 1.5;   // altitude (m) au-delà de laquelle on considère le drone "en vol"
+constexpr double CONTROL_PERIOD_S = 0.1;     // période (s) de la boucle de contrôle : 10Hz, diffusion + consigne Offboard
 // Comfortably above the leader's loiter cruise speed (LOITER_RADIUS_M *
 // LOITER_OMEGA =~ 0.84 m/s): a live flight test showed that with too little
 // margin here, a follower that gets separation-repulsed away from the
@@ -85,8 +138,8 @@ constexpr double CONTROL_PERIOD_S = 0.1;     // 10Hz: broadcast + Offboard setpo
 // leaderless sub-group. This margin plus the slower LOITER_PERIOD_S below
 // give followers enough spare speed to reliably close a transient gap
 // before it becomes unrecoverable.
-constexpr double MAX_SPEED_M_S = 3.5;
-constexpr double SEEK_KP = 0.8;              // proportional gain, target position -> velocity
+constexpr double MAX_SPEED_M_S = 3.5;  // vitesse maximale (m/s) autorisée pour toute consigne de vol
+constexpr double SEEK_KP = 0.8;              // gain proportionnel (loi de commande "seek") : écart de position -> vitesse
 
 // Damping gain: pulls back on however much my *actual* velocity (real MAVSDK
 // telemetry, not the setpoint just sent) exceeds the feedforward term. A
@@ -101,7 +154,7 @@ constexpr double SEEK_KP = 0.8;              // proportional gain, target positi
 // the next setpoint hasn't caught up with yet. Damping directly against
 // that real velocity turns this into a proper PD loop and removes the
 // oscillation.
-constexpr double SEEK_KD = 0.6;
+constexpr double SEEK_KD = 0.6;  // gain dérivé (amortissement) : contrôleur PD complet, évite les oscillations
 
 // Formation-seeking (not repulsion -- see below) is speed-capped for this
 // long right after becoming airborne, ramping linearly from
@@ -120,8 +173,8 @@ constexpr double SEEK_KD = 0.6;
 // 4m (see SPAWN_EAST_M / worlds/swarm_persistent.sdf) after this alone
 // wasn't enough to stop near-collisions -- untested whether it's sufficient
 // on its own.
-constexpr double TAKEOFF_SPEED_CAP_M_S = 1.0;
-constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;
+constexpr double TAKEOFF_SPEED_CAP_M_S = 1.0;  // vitesse plafond (m/s) juste après le décollage
+constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;   // durée (s) de la rampe qui remonte de TAKEOFF_SPEED_CAP_M_S vers MAX_SPEED_M_S
 
 // Finite "there and back" mission instead of an indefinite loiter/line loop:
 // every drone flies its role (scripted leader path, or formation-following)
@@ -139,10 +192,10 @@ constexpr double TAKEOFF_SPEED_RAMP_S = 8.0;
 // back the mission was already ending. 300s gives comfortable room to
 // actually narrate the formation and trigger the excursion demo before the
 // auto-return kicks in; RTL is still available on demand (Ctrl-C).
-constexpr double MISSION_OUTBOUND_S = 300.0;
-constexpr double HOME_ARRIVAL_RADIUS_M = 0.5; // horizontal distance from spawn to trigger landing
+constexpr double MISSION_OUTBOUND_S = 300.0;  // durée (s) de la mission avant retour automatique au point de spawn
+constexpr double HOME_ARRIVAL_RADIUS_M = 0.5; // distance horizontale (m) au spawn déclenchant l'atterrissage
 
-constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between any 2 drones
+constexpr double SAFE_DIST_M = 1.0;          // distance de sécurité minimale (m) imposée entre 2 drones quelconques
 
 // On-demand "fly away and come back" excursion (triggered via `ros2 param
 // set /drone_N excursion true`), for demoing the radio-range disconnect/
@@ -157,7 +210,7 @@ constexpr double SAFE_DIST_M = 1.0;          // hard separation floor between an
 // behavior at the swarm-comm level (still driven purely by real distance
 // vs. MAX_RANGE_M in on_peer_status()), reached by a continuous, physically
 // ordinary flight path instead of a jump.
-constexpr double EXCURSION_DURATION_S = 10.0;
+constexpr double EXCURSION_DURATION_S = 10.0;  // durée (s) de l'excursion volontaire hors formation (démo déconnexion/reconnexion)
 // Clear of MAX_RANGE_M (10m) so the excursion reads as a real disconnect to
 // peers, comfortably inside MAX_GEOFENCE_HARD_M (40m). Not just barely
 // clear: the target is a fixed offset from the excursing drone's own
@@ -179,7 +232,7 @@ constexpr double EXCURSION_DURATION_S = 10.0;
 // "Signal lost" line within a few seconds, just trigger it again
 // (`ros2 param set` is safe to repeat) -- worth fixing properly with more
 // time than a demo-eve pass allows.
-constexpr double EXCURSION_DISTANCE_M = 25.0;
+constexpr double EXCURSION_DISTANCE_M = 25.0;  // distance cible (m) de l'excursion, au-delà de MAX_RANGE_M pour provoquer une vraie déconnexion
 // Same speed-ramp idea as TAKEOFF_SPEED_RAMP_S, applied at excursion start: without it,
 // the position gap to a target 15m away saturates clamp_speed() immediately, snapping from
 // whatever formation-seeking velocity was commanded the tick before straight to
@@ -187,7 +240,7 @@ constexpr double EXCURSION_DISTANCE_M = 25.0;
 // gives a smooth departure instead of that step. The return leg needs no equivalent ramp:
 // by the time it happens, the same distance gap drives normal formation-seeking, which
 // already ramps down smoothly via seek_velocity's own P(D) term as the gap closes.
-constexpr double EXCURSION_RAMP_S = 2.0;
+constexpr double EXCURSION_RAMP_S = 2.0;  // durée (s) de la rampe de vitesse en début d'excursion (évite un à-coup)
 
 // Repulsion starts ramping at this distance, well before SAFE_DIST_M --
 // anticipatory rather than purely reactive. Chosen below the formation's
@@ -197,26 +250,27 @@ constexpr double EXCURSION_RAMP_S = 2.0;
 // old margin (repulsion only starting exactly at SAFE_DIST_M) meant
 // avoidance only ever kicked in once already in violation, one control
 // tick from breaching it further on any real closing speed.
-constexpr double AVOID_MARGIN_M = 1.4;
+constexpr double AVOID_MARGIN_M = 1.4;  // distance (m) à partir de laquelle la répulsion anticollision commence à monter en puissance
 
-// Consecutive control ticks (at CONTROL_PERIOD_S each) a peer can stay
-// inside SAFE_DIST_M before it's treated as chronic rather than a
-// momentary close call -- see control_step()'s use of close_encounter_ticks_.
+// Nombre de cycles de contrôle consécutifs (à CONTROL_PERIOD_S chacun) qu'un
+// pair peut passer sous SAFE_DIST_M avant d'être traité comme une proximité
+// "chronique" plutôt qu'un simple frôlement passager -- voir l'usage de
+// close_encounter_ticks_ dans control_step().
 constexpr int CHRONIC_TICKS_THRESHOLD = 20; // 2s at the 10Hz control rate
 
-// Triangle formation, in the leader's own forward/right frame.
-constexpr double FORMATION_TRAIL_M = 1.5;    // behind the leader
-constexpr double FORMATION_HALF_WIDTH_M = 1.0;
+// Formation en triangle, exprimée dans le repère avant/droite propre au leader.
+constexpr double FORMATION_TRAIL_M = 1.5;    // distance (m) derrière le leader
+constexpr double FORMATION_HALF_WIDTH_M = 1.0;  // décalage latéral (m) de chaque côté du leader
 
 // Leader's scripted reference path: circular loiter, centered between the
 // 3 spawn points, keyed off wall-clock time so a newly-elected leader
 // continues the same curve instead of restarting it.
-constexpr double LOITER_CENTER_EAST_M = 2.0;
-constexpr double LOITER_CENTER_NORTH_M = 0.0;
-constexpr double LOITER_RADIUS_M = 6.0;
-constexpr double LOITER_ALT_M = 3.0;
+constexpr double LOITER_CENTER_EAST_M = 2.0;   // centre du cercle de loiter (Est, m)
+constexpr double LOITER_CENTER_NORTH_M = 0.0;  // centre du cercle de loiter (Nord, m)
+constexpr double LOITER_RADIUS_M = 6.0;        // rayon du cercle (m)
+constexpr double LOITER_ALT_M = 3.0;           // altitude de croisière (m)
 constexpr double LOITER_PERIOD_S = 45.0; // slower cruise = more margin for followers to keep pace
-constexpr double LOITER_OMEGA = 2.0 * M_PI / LOITER_PERIOD_S;
+constexpr double LOITER_OMEGA = 2.0 * M_PI / LOITER_PERIOD_S;  // vitesse angulaire (rad/s) déduite de la période
 
 // Alternative leader path: a straight line back and forth along the east
 // axis (through the same center point as the loiter), selected via the
@@ -231,9 +285,9 @@ constexpr double LOITER_OMEGA = 2.0 * M_PI / LOITER_PERIOD_S;
 // control tick. sin/cos gives continuous position *and* velocity
 // everywhere, so there's no discontinuity for a follower to react badly
 // to, matching how the circular loiter never had this problem.
-constexpr double LINE_HALF_LENGTH_M = 8.0;
+constexpr double LINE_HALF_LENGTH_M = 8.0;  // demi-longueur (m) du segment parcouru par le motif "line"
 constexpr double LINE_SPEED_M_S = 1.0; // peak speed, at the center of the traversal
-constexpr double LINE_OMEGA = LINE_SPEED_M_S / LINE_HALF_LENGTH_M; // rad/s
+constexpr double LINE_OMEGA = LINE_SPEED_M_S / LINE_HALF_LENGTH_M; // rad/s -- pulsation équivalente du mouvement sinusoïdal
 
 // Safety bounds: any flight target (leader's own reference point, or a
 // follower's formation slot) gets clamped into this box/cylinder before
@@ -246,11 +300,11 @@ constexpr double LINE_OMEGA = LINE_SPEED_M_S / LINE_HALF_LENGTH_M; // rad/s
 // test caught exactly this: a follower isolated during a network split,
 // still chasing a stale target at full speed, reached 41m out -- well
 // past GEOFENCE_RADIUS_M -- before the split resolved and it turned back).
-constexpr double GEOFENCE_RADIUS_M = 30.0;
-constexpr double MIN_ALT_M = 1.0;
-constexpr double MAX_ALT_M = 6.0;
-constexpr double MAX_ALT_HARD_M = 10.0;
-constexpr double MAX_GEOFENCE_HARD_M = 40.0;
+constexpr double GEOFENCE_RADIUS_M = 30.0;  // rayon (m) de la barrière géographique "souple" appliquée aux cibles visées
+constexpr double MIN_ALT_M = 1.0;           // altitude minimale (m) autorisée pour une cible
+constexpr double MAX_ALT_M = 6.0;           // altitude maximale (m) autorisée pour une cible
+constexpr double MAX_ALT_HARD_M = 10.0;     // altitude réelle maximale (m) : au-delà, atterrissage d'urgence
+constexpr double MAX_GEOFENCE_HARD_M = 40.0; // distance réelle maximale (m) à l'origine : au-delà, atterrissage d'urgence
 
 // Low-altitude counterpart to MAX_ALT_HARD_M -- well below MIN_ALT_M's
 // already-clamped target band, so normal flight (including post-takeoff
@@ -264,19 +318,22 @@ constexpr double MAX_GEOFENCE_HARD_M = 40.0;
 // control tick of crossing this floor -- long before it's deep enough for
 // that impulse to happen -- rather than continuing to fight it from inside
 // Offboard while the discrepancy grows.
-constexpr double MIN_ALT_HARD_M = 0.3;
+constexpr double MIN_ALT_HARD_M = 0.3;  // altitude réelle minimale (m) : en dessous, atterrissage d'urgence (garde-fou bas)
 
 // Diagnostic instrumentation kept permanently for the still-open
 // low-altitude physics anomaly (see MIN_ALT_HARD_M): once a drone strays
 // this far from origin (well before MAX_GEOFENCE_HARD_M), dump full
 // per-tick internal state so a horizontal excursion can be traced as it
 // forms rather than only caught after the fact at 40m.
-constexpr double DRIFT_TRACE_M = 12.0;
+constexpr double DRIFT_TRACE_M = 12.0;  // distance (m) à l'origine déclenchant les logs de diagnostic détaillés
 
+// Vecteur 3D générique utilisé partout dans ce fichier pour représenter une
+// position ou une vitesse dans le repère monde partagé (Est/Nord/Haut).
 struct Vec3 {
     double x = 0, y = 0, z = 0; // east, north, up
 };
 
+// Distance euclidienne (m) entre deux points 3D quelconques.
 double distance_m(double x1, double y1, double z1, double x2, double y2, double z2) {
     double dx = x1 - x2, dy = y1 - y2, dz = z1 - z2;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -295,6 +352,11 @@ double distance_m(double x1, double y1, double z1, double x2, double y2, double 
 // via telemetry) with no matching setpoint anywhere near that. Giving
 // altitude its own speed budget means it's never starved by horizontal
 // chaos.
+// Limite la vitesse d'un vecteur à max_speed, horizontalement et
+// verticalement DE FAÇON SÉPARÉE (composante horizontale x/y réduite en
+// gardant sa direction, composante verticale z bornée indépendamment) --
+// voir le commentaire au-dessus pour la raison (éviter qu'une grosse
+// correction horizontale n'écrase la correction d'altitude).
 Vec3 clamp_speed(Vec3 v, double max_speed) {
     double horiz = std::hypot(v.x, v.y);
     if (horiz > max_speed && horiz > 1e-6) {
@@ -307,6 +369,10 @@ Vec3 clamp_speed(Vec3 v, double max_speed) {
 
 // Pulls a flight target back inside the geofence cylinder / altitude band
 // before it's ever pursued -- see GEOFENCE_RADIUS_M etc.
+// Ramène une cible (point que le drone cherche à atteindre) à l'intérieur
+// du cylindre de barrière géographique (GEOFENCE_RADIUS_M) et de la bande
+// d'altitude autorisée (MIN_ALT_M..MAX_ALT_M), avant même qu'elle soit
+// poursuivie par la loi de commande.
 Vec3 clamp_to_geofence(Vec3 target) {
     double horiz = std::hypot(target.x, target.y);
     if (horiz > GEOFENCE_RADIUS_M) {
@@ -326,7 +392,14 @@ Vec3 clamp_to_geofence(Vec3 target) {
 // circle, and a leader starting far from that point would dash toward it
 // at full speed the moment it goes airborne, dragging followers (which
 // have no such shortcut) into a losing tail chase.
+// Point de référence renvoyé par les trajectoires scriptées du leader :
+// position visée (pos) et sa vitesse feedforward associée (vel).
 struct ReferencePoint { Vec3 pos, vel; };
+
+// Calcule le point de la trajectoire circulaire ("loiter") du leader à
+// l'instant t (secondes), plus sa vitesse feedforward (tangente au cercle).
+// phase_offset recale le cercle pour qu'un nouveau leader reprenne la
+// courbe là où il se trouve, sans "sauter" vers un point arbitraire.
 ReferencePoint loiter_reference(double t, double phase_offset) {
     double phase = LOITER_OMEGA * t + phase_offset;
     ReferencePoint r;
@@ -343,6 +416,9 @@ ReferencePoint loiter_reference(double t, double phase_offset) {
 // the east axis. phase_offset plays the same re-anchoring role it does
 // for the loiter -- an angle, since this is sinusoidal too now (see the
 // comment on LINE_OMEGA for why it isn't a constant-speed triangle wave).
+// Équivalent de loiter_reference() pour le motif "line" : trajectoire en
+// aller-retour sinusoïdal le long de l'axe Est, avec la même logique de
+// phase_offset pour recaler la position au moment d'une prise de leadership.
 ReferencePoint line_reference(double t, double phase_offset) {
     double phase = LINE_OMEGA * t + phase_offset;
     ReferencePoint r;
@@ -358,6 +434,9 @@ ReferencePoint line_reference(double t, double phase_offset) {
 // Rotates a (forward, right) offset in the leader's heading frame into the
 // shared world (east, north) frame. heading_rad is a compass bearing
 // (0 = North, increasing toward East), matching NED yaw.
+// Fait pivoter un décalage (avant, droite) exprimé dans le repère "cap du
+// leader" vers le repère monde partagé (Est, Nord). heading_rad est un cap
+// façon boussole (0 = Nord, augmente vers l'Est), cohérent avec le lacet NED.
 Vec3 rotate_formation_offset(double forward_m, double right_m, double heading_rad, double up_m) {
     double fwd_e = std::sin(heading_rad), fwd_n = std::cos(heading_rad);
     double right_e = std::cos(heading_rad), right_n = -std::sin(heading_rad);
@@ -374,6 +453,12 @@ Vec3 rotate_formation_offset(double forward_m, double right_m, double heading_ra
 // -avoidance, pre-clamp). Kept free of ROS/MAVSDK types so the formation
 // math is exercised the same way whether driven by real telemetry or a
 // kinematic stand-in.
+// Loi de commande PD (proportionnelle-dérivée) + feedforward : calcule la
+// vitesse à commander pour rejoindre `target` depuis `my_pos`, en tenant
+// compte de la vitesse actuelle `my_vel` (terme dérivé, amortissement) et
+// d'une vitesse feedforward optionnelle (ex : vitesse du leader à suivre).
+// Ne dépend d'aucun type ROS/MAVSDK -- testable indépendamment de la
+// simulation réelle.
 Vec3 seek_velocity(const Vec3& target, const Vec3& my_pos, const Vec3& my_vel,
                     const Vec3& feedforward = Vec3{}) {
     Vec3 v;
@@ -421,6 +506,11 @@ Vec3 seek_velocity(const Vec3& target, const Vec3& my_pos, const Vec3& my_vel,
 // impulse (see MIN_ALT_HARD_M). Since vertical separation was never doing
 // real collision-avoidance work here (the formation has none to preserve),
 // dropping it removes the risk without giving up anything.
+// Calcule un vecteur de répulsion (anticollision) qui écarte le drone de
+// chaque pair tracké situé à moins de AVOID_MARGIN_M, avec une montée en
+// puissance quadratique (douce au début, pleine puissance dès SAFE_DIST_M
+// atteint). Uniquement horizontal (x/y) -- jamais de composante verticale,
+// puisque la formation est plate par construction (voir commentaire ci-dessus).
 Vec3 separation_repulsion(const Vec3& my_pos, const std::vector<Vec3>& peer_positions) {
     Vec3 push;
     for (const auto& p : peer_positions) {
@@ -437,18 +527,34 @@ Vec3 separation_repulsion(const Vec3& my_pos, const std::vector<Vec3>& peer_posi
 
 } // namespace
 
+// État suivi localement pour chaque AUTRE drone de l'essaim (un tracker par
+// pair, stocké dans SwarmNode::trackers_). Mis à jour à chaque réception
+// d'un message SwarmStatus de ce pair (voir on_peer_status()) et par le
+// contrôle de timeout (voir check_and_elect()).
 struct DroneTracker {
-    rclcpp::Time last_seen;
-    bool has_seen = false;
-    bool connected = false;
-    int last_claimed_leader = NO_LEADER;
-    Vec3 pos, vel;
+    rclcpp::Time last_seen;           // horodatage ROS du dernier message reçu de ce pair
+    bool has_seen = false;            // au moins un message a déjà été reçu de ce pair
+    bool connected = false;           // pair actuellement "en vie" (pas de timeout dépassé)
+    int last_claimed_leader = NO_LEADER;  // dernier leader que CE pair prétendait suivre (pour le vote)
+    Vec3 pos, vel;                    // dernière position/vitesse connues de ce pair (repère monde)
     Vec3 ref_vel; // analytical scripted-path velocity, only meaningful while this peer is leader
     bool ready = false; // this peer's own offboard_ready_ -- see SwarmStatus.msg's `ready` field
 };
 
+// Nœud ROS2 principal exécuté par chaque drone de l'essaim. Combine :
+// - la connexion/pilotage MAVSDK vers PX4 (thread dédié, voir connect_and_fly()) ;
+// - la communication et le suivi des autres drones (publication/souscription
+//   du topic SwarmStatus, voir on_peer_status()) ;
+// - l'élection de leader (voir elect_leader()) ;
+// - la boucle de contrôle 10Hz qui calcule et envoie les consignes de
+//   vitesse Offboard selon le rôle (leader ou follower), voir control_step().
 class SwarmNode : public rclcpp::Node {
 public:
+    // Constructeur : lit le paramètre "id" (numéro du drone, 0 à MAX_DRONES-1,
+    // obligatoire), initialise les trackers pour les autres drones, crée le
+    // publisher/les souscriptions ROS2, déclare les paramètres dynamiques
+    // (x/y/z, excursion, flight_pattern), démarre les timers de contrôle et
+    // d'élection, puis lance la connexion MAVSDK sur un thread séparé.
     SwarmNode() : Node("swarm_node") {
         my_id_ = declare_parameter<int>("id", -1);
         if (my_id_ < 0 || my_id_ >= MAX_DRONES) {
@@ -460,6 +566,8 @@ public:
             if (i != my_id_) trackers_[i]; // default-constructs via map::operator[]
         }
 
+        // Publie mon propre statut sur mon topic dédié, et m'abonne au topic
+        // de chaque autre drone pour recevoir le leur (communication inter-drones).
         pub_ = create_publisher<SwarmStatus>("/drone_" + std::to_string(my_id_) + "/swarm_status", 10);
         for (int peer = 0; peer < MAX_DRONES; ++peer) {
             if (peer == my_id_) continue;
@@ -490,6 +598,9 @@ public:
         my_x_.store(get_parameter("x").as_double());
         my_y_.store(get_parameter("y").as_double());
         my_z_.store(get_parameter("z").as_double());
+        // Callback appelé à chaque `ros2 param set` sur ce nœud : met à jour
+        // x/y/z (position de secours) et déclenche une excursion si le
+        // paramètre "excursion" passe à true (front montant uniquement).
         param_cb_handle_ = add_on_set_parameters_callback(
             [this](const std::vector<rclcpp::Parameter>& params) {
                 for (const auto& p : params) {
@@ -513,6 +624,8 @@ public:
                 return result;
             });
 
+        // Timer 1 (10Hz) : boucle de contrôle/pilotage -- voir control_step().
+        // Timer 2 (2Hz) : détection des pairs perdus (timeout) + élection du leader.
         control_timer_ = create_wall_timer(
             std::chrono::duration<double>(CONTROL_PERIOD_S), [this]() { control_step(); });
         check_timer_ = create_wall_timer(500ms, [this]() { check_and_elect(); });
@@ -540,6 +653,12 @@ private:
     // --- MAVSDK setup + arm/takeoff/offboard sequence, run on its own
     // thread so it never blocks the ROS executor (this involves several
     // blocking MAVSDK calls and a 30s connection wait). ---
+    // Séquence complète de connexion au pilote automatique et de mise en
+    // vol : connexion MAVSDK à PX4, abonnement à la télémétrie (position,
+    // vitesse, mode de vol, santé...), armement, décollage, puis bascule
+    // en mode Offboard (mode où ce nœud contrôle directement la vitesse du
+    // drone). Tourne sur un thread séparé pour ne jamais bloquer
+    // l'exécuteur ROS2 pendant les appels MAVSDK bloquants.
     void connect_and_fly() {
         mavsdk_ = std::make_unique<mavsdk::Mavsdk>(
             mavsdk::Mavsdk::Configuration{mavsdk::ComponentType::GroundStation});
@@ -566,6 +685,12 @@ private:
         action_ = std::make_unique<mavsdk::Action>(system.value());
         offboard_ = std::make_unique<mavsdk::Offboard>(system.value());
 
+        // Callback télémétrie principal : convertit la position/vitesse NED
+        // locale (propre à ce véhicule) en repère monde partagé Est/Nord/Haut
+        // en ajoutant le décalage de spawn (voir SPAWN_EAST_M/SPAWN_NORTH_M et
+        // la note "Frame" en en-tête du fichier). Écrit dans des std::atomic
+        // car ce callback tourne sur le thread MAVSDK, concurremment avec le
+        // thread des timers ROS2.
         telemetry_->subscribe_position_velocity_ned([this](mavsdk::Telemetry::PositionVelocityNed pv) {
             my_x_.store(SPAWN_EAST_M[my_id_] + pv.position.east_m);
             my_y_.store(SPAWN_NORTH_M[my_id_] + pv.position.north_m);
@@ -583,6 +708,8 @@ private:
         // setpoints being sent successfully (Offboard::Result::Success)
         // while PX4 silently ignores them because it's not actually in
         // Offboard mode.
+        // Suit le mode de vol RÉEL de PX4 (pas seulement si notre appel
+        // offboard_->start() a été accepté) : journalise chaque changement.
         telemetry_->subscribe_flight_mode([this](mavsdk::Telemetry::FlightMode mode) {
             auto m = static_cast<int>(mode);
             current_flight_mode_.store(m);
@@ -601,6 +728,9 @@ private:
         // computes -- if this is a real PX4-side event (crash detector,
         // EKF reset, a disarm) rather than a pure Gazebo physics glitch, this
         // is where it would show up.
+        // Callbacks de diagnostic (texte de statut PX4, état armé/désarmé,
+        // état "posé"/en vol) : journalisent uniquement les CHANGEMENTS
+        // d'état, utiles pour comprendre un comportement anormal côté PX4.
         telemetry_->subscribe_status_text([this](mavsdk::Telemetry::StatusText st) {
             RCLCPP_WARN(get_logger(), "[%s] PX4 STATUSTEXT: %s", my_name_.c_str(), st.text.c_str());
         });
@@ -631,6 +761,8 @@ private:
             my_pitch_deg_.store(angle.pitch_deg);
         });
 
+        // Attend que le GPS (position globale) et le point "home" soient
+        // valides côté PX4 avant de continuer -- max 30s d'attente.
         RCLCPP_INFO(get_logger(), "[%s] Waiting for global + home position...", my_name_.c_str());
         // Captured by value (shared_ptr) rather than by reference: this
         // subscription is never explicitly cancelled, so a by-reference
@@ -652,6 +784,9 @@ private:
             return;
         }
 
+        // Armement puis décollage (commandes MAVSDK Action), puis attente
+        // (max 30s) que l'altitude réelle dépasse TAKEOFF_WAIT_ALT_M avant
+        // de considérer le drone "en vol".
         RCLCPP_INFO(get_logger(), "[%s] Arming...", my_name_.c_str());
         if (auto res = action_->arm(); res != mavsdk::Action::Result::Success) {
             RCLCPP_ERROR(get_logger(), "[%s] Arm failed", my_name_.c_str());
@@ -677,6 +812,11 @@ private:
         // setpoint stream not yet "established" going into the switch.
         // Confirm against the real flight mode rather than trusting the
         // single start() call, and retry if it didn't stick.
+        // Bascule en mode Offboard : envoie d'abord des consignes nulles
+        // pour amorcer le flux (requis par PX4), puis demande le mode
+        // Offboard et VÉRIFIE contre le mode de vol réel (pas seulement le
+        // retour de l'appel) que PX4 y reste effectivement -- jusqu'à 5
+        // tentatives en cas de rejet ou de retour immédiat à Hold.
         bool entered_offboard = false;
         for (int attempt = 0; attempt < 5 && !entered_offboard; ++attempt) {
             offboard_->set_velocity_ned({0.0f, 0.0f, 0.0f, 0.0f});
@@ -707,11 +847,21 @@ private:
 
     // --- 10Hz loop: publish real telemetry, and (once airborne) send the
     // role-appropriate Offboard velocity setpoint. ---
+    // Cœur du nœud, appelé 10 fois par seconde (CONTROL_PERIOD_S) :
+    //   1) construit et publie le message SwarmStatus (ma position/vitesse,
+    //      qui je pense être le leader, l'état de mes pairs connectés) ;
+    //   2) vérifie les garde-fous de sécurité durs (altitude, géo-barrière,
+    //      retour au point de spawn) -- atterrissage d'urgence si dépassés ;
+    //   3) calcule la vitesse désirée selon mon rôle (leader/follower),
+    //      applique la rampe de vitesse au décollage/en excursion, mélange
+    //      avec la répulsion anticollision, puis envoie la consigne de
+    //      vitesse Offboard réelle à PX4.
     void control_step() {
         double now_s = now().seconds();
         Vec3 my_pos{my_x_.load(), my_y_.load(), my_z_.load()};
         Vec3 my_vel{my_vx_.load(), my_vy_.load(), my_vz_.load()};
 
+        // Construction du message d'état diffusé aux autres drones.
         SwarmStatus msg;
         msg.sender_id = my_id_;
         msg.claimed_leader = leader_id_;
@@ -735,14 +885,18 @@ private:
         }
         pub_->publish(msg);
 
-        if (!offboard_ready_.load()) return;
+        if (!offboard_ready_.load()) return;  // pas encore en vol Offboard : rien d'autre à faire ce tick
 
+        // Fin automatique de l'excursion une fois sa durée écoulée.
         if (excursion_active_ && now_s > excursion_until_s_) {
             excursion_active_ = false;
             RCLCPP_INFO(get_logger(), "[%s] Excursion complete -- resuming formation.",
                         my_name_.c_str());
         }
 
+        // --- Garde-fous de sécurité durs : altitude haute, altitude basse,
+        // géo-barrière, retour au point de spawn -- chacun déclenche un
+        // atterrissage immédiat (action_->land()) et coupe le mode Offboard. ---
         if (my_pos.z > MAX_ALT_HARD_M) {
             // Hard backstop on actual altitude, independent of and in
             // addition to clamp_to_geofence() on *targets*: catches a bug
@@ -782,6 +936,7 @@ private:
             return;
         }
 
+        // Vitesse "désirée" selon mon rôle actuel (leader/follower/retour au spawn/excursion).
         Vec3 desired = compute_role_velocity(my_pos, my_vel);
         // Speed-cap formation-seeking only (not repulsion, computed below with its own
         // full-strength authority), ramping up from TAKEOFF_SPEED_CAP_M_S right after
@@ -802,6 +957,7 @@ private:
             speed_cap = std::min(speed_cap, excursion_speed_cap);
         }
         desired = clamp_speed(desired, speed_cap);
+        // Ne considère que les pairs actuellement connectés pour la répulsion.
         std::vector<Vec3> peer_positions;
         for (auto& [id, tracker] : trackers_) {
             if (tracker.connected) peer_positions.push_back(tracker.pos);
@@ -810,6 +966,8 @@ private:
         double repulsion_mag = std::sqrt(
             repulsion.x * repulsion.x + repulsion.y * repulsion.y + repulsion.z * repulsion.z);
 
+        // Distance au pair connecté le plus proche, pour détecter/journaliser
+        // une violation de la distance de sécurité (SAFE_DIST_M).
         double min_dist = std::numeric_limits<double>::infinity();
         for (const auto& p : peer_positions) {
             min_dist = std::min(min_dist, distance_m(my_pos.x, my_pos.y, my_pos.z, p.x, p.y, p.z));
@@ -835,6 +993,10 @@ private:
         // CHRONIC_TICKS_THRESHOLD, drop formation-seeking entirely and
         // spend the whole speed budget on escaping -- once clear,
         // close_encounter_ticks_ resets and normal blending resumes.
+        // Proximité "chronique" (dépasse CHRONIC_TICKS_THRESHOLD ticks) : on
+        // abandonne totalement la poursuite de formation pour consacrer
+        // toute la vitesse disponible à l'évitement -- voir le long
+        // commentaire ci-dessus pour le raisonnement détaillé.
         bool chronic = close_encounter_ticks_ > CHRONIC_TICKS_THRESHOLD;
         if (chronic && close_encounter_ticks_ % 20 == 0) {
             RCLCPP_ERROR(get_logger(),
@@ -849,6 +1011,9 @@ private:
         // direction loses out. A live test showed the old additive
         // approach let a strong seek command water down avoidance right
         // when a peer was closest -- exactly the wrong moment for that.
+        // Mélange par PRIORITÉ (pas une simple somme) : plus la répulsion est
+        // forte, plus elle prend de poids sur la composante "formation" au
+        // lieu de simplement s'additionner puis d'être écrêtée.
         double repulsion_weight = chronic ? 1.0 : std::clamp(repulsion_mag / MAX_SPEED_M_S, 0.0, 1.0);
         Vec3 blended{
             desired.x * (1.0 - repulsion_weight) + repulsion.x,
@@ -862,8 +1027,10 @@ private:
             // has nothing to do with horizontal avoidance, so it keeps full authority always.
             desired.z,
         };
-        Vec3 command = clamp_speed(blended, MAX_SPEED_M_S);
+        Vec3 command = clamp_speed(blended, MAX_SPEED_M_S);  // consigne finale, écrêtée à MAX_SPEED_M_S
 
+        // Log de diagnostic détaillé si le drone s'éloigne anormalement de
+        // l'origine (dérive) -- aide à comprendre après coup ce qui s'est passé.
         if (std::hypot(my_pos.x, my_pos.y) > DRIFT_TRACE_M) {
             RCLCPP_WARN(get_logger(),
                 "[%s] DRIFT_TRACE role=%s pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) min_dist=%.2f "
@@ -885,6 +1052,9 @@ private:
                 my_roll_deg_.load(), my_pitch_deg_.load());
         }
 
+        // Envoi de la consigne réelle à PX4 : conversion du repère interne
+        // (est, nord, haut) vers le repère attendu par MAVSDK
+        // NED = (nord, est, bas). En cas d'échec répété, voir handle_offboard_failure().
         // NED = (north, east, down); command is stored (east, north, up).
         auto res = offboard_->set_velocity_ned(
             {static_cast<float>(command.y), static_cast<float>(command.x),
@@ -896,6 +1066,9 @@ private:
 
     // Past MISSION_OUTBOUND_S airborne: every drone heads home on its own,
     // regardless of role -- see MISSION_OUTBOUND_S's comment.
+    // Vrai une fois la mission terminée (MISSION_OUTBOUND_S écoulées depuis
+    // le décollage) : chaque drone rentre alors seul à son point de spawn,
+    // sans coordination supplémentaire nécessaire.
     bool returning_home() const {
         return now().seconds() - airborne_since_s_.load() > MISSION_OUTBOUND_S;
     }
@@ -904,6 +1077,14 @@ private:
     // Follower: hold a triangle-formation offset on the live leader.
     // Neither role known yet, or leader's position not seen yet: hover.
     // Past MISSION_OUTBOUND_S: role/formation ignored, straight home instead.
+    // Calcule la vitesse "désirée" (avant répulsion/écrêtage) selon la
+    // situation actuelle, par ordre de priorité :
+    //   1) excursion en cours -> cap vers la cible d'excursion ;
+    //   2) mission terminée -> cap vers le point de spawn (atterrissage) ;
+    //   3) je suis le leader -> je suis ma trajectoire scriptée (loiter/line) ;
+    //   4) pas de leader connu/prêt -> vol stationnaire (hover) ;
+    //   5) sinon (follower normal) -> tenir ma place dans la formation
+    //      triangle par rapport au leader suivi.
     Vec3 compute_role_velocity(const Vec3& my_pos, const Vec3& my_vel) {
         if (excursion_active_) {
             // Overrides role/formation entirely while active -- the point is to actually
@@ -958,6 +1139,9 @@ private:
         double leader_speed = std::hypot(leader.ref_vel.x, leader.ref_vel.y);
         if (leader_speed > 0.03) leader_heading_rad_ = std::atan2(leader.ref_vel.x, leader.ref_vel.y);
 
+        // Calcule ma position cible dans la formation triangle : décalage
+        // (arrière, gauche/droite) selon mon côté assigné, tourné selon le
+        // cap actuel du leader, puis ajouté à sa position -- borné par la géo-barrière.
         double lateral = formation_side_is_left() ? FORMATION_HALF_WIDTH_M : -FORMATION_HALF_WIDTH_M;
         Vec3 offset = rotate_formation_offset(-FORMATION_TRAIL_M, lateral, leader_heading_rad_, 0.0);
         Vec3 target = clamp_to_geofence(Vec3{leader.pos.x + offset.x, leader.pos.y + offset.y, leader.pos.z});
@@ -974,6 +1158,9 @@ private:
 
     // Deterministic slot assignment among the (up to) 2 non-leader drones:
     // the smaller surviving id takes the left slot.
+    // Attribution déterministe du côté (gauche/droite) dans la formation
+    // parmi les (au plus 2) drones non-leaders : le plus petit id restant
+    // prend systématiquement la gauche.
     bool formation_side_is_left() {
         std::vector<int> followers;
         for (int i = 0; i < MAX_DRONES; ++i) {
@@ -983,6 +1170,8 @@ private:
         return !followers.empty() && followers.front() == my_id_;
     }
 
+    // Compte les échecs consécutifs d'envoi de consigne Offboard ; après 5
+    // échecs de suite, atterrissage de sécurité (le lien Offboard est jugé rompu).
     void handle_offboard_failure() {
         if (++offboard_failure_count_ < 5) return;
         RCLCPP_ERROR(get_logger(), "[%s] Offboard setpoint rejected repeatedly -- landing.", my_name_.c_str());
@@ -991,6 +1180,12 @@ private:
         offboard_failure_count_ = 0;
     }
 
+    // Callback de réception d'un message SwarmStatus d'un pair (souscription
+    // ROS2). Simule la portée radio : un message venant d'un pair trop
+    // éloigné (> MAX_RANGE_M) est purement ignoré, comme s'il n'était jamais
+    // arrivé. Sinon, met à jour le tracker de ce pair (position, vitesse,
+    // leader qu'il revendique, état "ready") et journalise la première
+    // détection d'un signal.
     void on_peer_status(int peer, SwarmStatus::SharedPtr msg) {
         double range = distance_m(my_x_.load(), my_y_.load(), my_z_.load(), msg->x, msg->y, msg->z);
         if (range > MAX_RANGE_M) return; // out of simulated radio range: same as not receiving anything
@@ -1010,6 +1205,9 @@ private:
         }
     }
 
+    // Appelé toutes les 500ms (check_timer_) : marque comme déconnecté tout
+    // pair dont on n'a plus reçu de message depuis plus de TIMEOUT_S
+    // secondes (gestion du timeout/heartbeat), puis relance l'élection.
     void check_and_elect() {
         rclcpp::Time now_t = now();
         for (auto& [id, tracker] : trackers_) {
@@ -1038,13 +1236,29 @@ private:
     // currently alive (self included) fixes that: the 2 drones that
     // already agree on the real leader always outvote the 1 reconnecting
     // drone still relaying its stale belief, regardless of message timing.
+    // ALGORITHME D'ÉLECTION DE LEADER : vote majoritaire parmi les drones
+    // actuellement "en vie" (connectés), avec repli déterministe sur le plus
+    // petit id en cas d'égalité ou d'absence de vote exploitable. Points clés :
+    //   - "Sticky" : un ancien leader qui revient ne reprend pas le rôle
+    //     automatiquement -- il faut que le vote le redésigne.
+    //   - Chaque drone vote pour le leader qu'il croit actuellement valide
+    //     (sa propre croyance + la dernière revendication connue de chaque
+    //     pair vivant), ce qui permet à la majorité de 2 drones déjà
+    //     d'accord de l'emporter sur 1 drone qui vient de se reconnecter et
+    //     relaie encore une croyance périmée (voir le long commentaire
+    //     ci-dessus pour l'historique du bug corrigé par cette approche).
     void elect_leader() {
+        // Liste des drones actuellement joignables (moi + pairs connectés).
         std::vector<int> alive = {my_id_};
         for (auto& [id, tracker] : trackers_) {
             if (tracker.connected) alive.push_back(id);
         }
-        if (alive.size() == 1) return;
+        if (alive.size() == 1) return;  // seul en vie : rien à élire, on garde la croyance actuelle
 
+        // Comptage des votes : un vote = une croyance sur le leader actuel,
+        // émise soit par moi-même, soit par un pair vivant (sa dernière
+        // revendication reçue). Une croyance pointant vers un drone qui
+        // n'est plus vivant est ignorée (croyance périmée).
         std::map<int, int> votes;
         // My own current belief is one vote, but only if it's still someone
         // alive -- otherwise it's a stale belief about to be corrected, and
@@ -1061,6 +1275,9 @@ private:
             }
         }
 
+        // Recherche du candidat ayant le plus de votes ; détecte aussi une
+        // éventuelle égalité (tied_with > 0) pour ne jamais choisir
+        // arbitrairement entre deux candidats à égalité.
         int winner = NO_LEADER, winner_votes = 0, tied_with = 0;
         for (auto& [candidate, count] : votes) {
             if (count > winner_votes) {
@@ -1073,14 +1290,21 @@ private:
         }
         // No usable votes yet, or a tie nobody breaks (e.g. fresh boot,
         // everyone still claims NO_LEADER): fall back to smallest alive ID.
+        // -> Aucun vote exploitable, ou égalité non tranchée (ex : démarrage à
+        // froid où tout le monde revendique encore NO_LEADER) : repli
+        // déterministe sur le plus petit id parmi les drones vivants.
         int new_leader = (winner == NO_LEADER || tied_with > 0)
             ? *std::min_element(alive.begin(), alive.end())
             : winner;
 
         int old_leader = leader_id_;
-        if (new_leader == old_leader) return;
+        if (new_leader == old_leader) return;  // pas de changement : rien à faire
         leader_id_ = new_leader;
         if (new_leader == my_id_) {
+            // Je viens de devenir/rester leader : je dois recaler la phase de
+            // ma trajectoire scriptée (cercle ou ligne) sur ma position
+            // actuelle, pour ne pas "sauter" brutalement vers un point
+            // arbitraire de la courbe dicté par l'horloge murale.
             // Re-anchor the loiter circle's phase to wherever I actually am
             // right now, so I pick up the path from here instead of
             // dashing toward whatever point wall-clock time happens to put

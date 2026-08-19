@@ -4,8 +4,11 @@
 # fait plus disparaître.
 set -euo pipefail
 
+# Chemin du dépôt PX4-Autopilot (contient le binaire SITL déjà compilé)
 PX4_DIR="$HOME/PX4-Autopilot"
+# Binaire SITL PX4 (simulation logicielle, un process par drone)
 BIN="$PX4_DIR/build/px4_sitl_default/bin/px4"
+# Nom du monde Gazebo persistant utilisé pour la simulation
 WORLD_NAME="swarm_persistent"
 # Le monde persistant vit dans ce projet ; un lien symbolique dans
 # PX4-Autopilot/Tools/simulation/gz/worlds/ permet à PX4 de le trouver
@@ -21,9 +24,13 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+# PX4 doit être lancé depuis son propre répertoire pour retrouver ses scripts
 cd "$PX4_DIR"
 
+# Tableau des PID des 3 process PX4 lancés en arrière-plan
 pids=()
+# Fonction appelée à la sortie du script (ou Ctrl+C) : tue proprement
+# toutes les instances PX4 encore en cours au lieu de les laisser en zombies
 cleanup() {
   echo "Arrêt des instances PX4..."
   for pid in "${pids[@]}"; do
@@ -53,4 +60,6 @@ PX4_GZ_STANDALONE=1 PX4_GZ_WORLD="$WORLD_NAME" PX4_GZ_MODEL_NAME=x500_2 PX4_SYS_
 pids+=($!)
 
 echo "3 drones lancés. Ctrl+C pour tout arrêter."
+# Attend la fin de tous les process en arrière-plan (bloque le script tant
+# qu'au moins une instance PX4 tourne ; Ctrl+C déclenche le trap cleanup)
 wait

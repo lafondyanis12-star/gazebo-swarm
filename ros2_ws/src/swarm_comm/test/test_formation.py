@@ -1,48 +1,54 @@
-# Formation + in-flight-failover checks against a REAL PX4 SITL flight --
-# unlike test_election.py, this drives actual MAVSDK-piloted drones, not
-# just the comm/election layer on fake positions.
+# Verifications de formation + de bascule de leader en vol contre un VRAI
+# vol PX4 SITL -- contrairement a test_election.py, ceci pilote de vrais
+# drones commandes par MAVSDK, pas seulement la couche communication/
+# election sur des positions fictives.
 #
-# Precondition: run_swarm.sh must already be up (3 PX4 SITL + Gazebo
-# instances on ports 14540-14542) -- ideally as `HEADLESS=1 ./run_swarm.sh`
-# (see the README's "What's left": Gazebo's GUI client otherwise competes
-# with the 3 physics instances for CPU/GPU and measurably worsens
-# connectivity jitter). Run it by hand, one command per terminal:
+# Precondition : run_swarm.sh doit deja tourner (3 instances PX4 SITL +
+# Gazebo sur les ports 14540-14542) -- idealement via
+# `HEADLESS=1 ./run_swarm.sh` (voir "What's left" du README : sinon le
+# client GUI de Gazebo entre en concurrence avec les 3 instances physiques
+# pour le CPU/GPU et degrade mesurablement la gigue de connectivite).
+# A lancer a la main, une commande par terminal :
 #
 #   HEADLESS=1 ./run_swarm.sh                                   # terminal 1
 #   ros2 launch_test src/swarm_comm/test/test_formation.py      # terminal 2
 #
-# `drone_0.terminate()` was never valid -- launch_ros.actions.Node has no
-# such method (only sigterm_timeout/sigkill_timeout config, not an action);
-# calling it always raised AttributeError. Latent since this file was first
-# written: the fixture object test methods receive here is the launch
-# *action*, not a running-process handle, and nothing had exercised this
-# specific code path before -- leader failover had only ever been verified
-# by hand (kill -SIGINT on a pid found via pgrep), which is exactly what
-# this now does programmatically instead.
+# `drone_0.terminate()` n'a jamais ete valide -- launch_ros.actions.Node n'a
+# pas une telle methode (seulement une config sigterm_timeout/sigkill_timeout,
+# pas une action) ; l'appeler levait toujours une AttributeError. Ce bug etait
+# latent depuis la premiere ecriture de ce fichier : l'objet fixture que les
+# methodes de test recoivent ici est l'*action* de lancement, pas un handle
+# de processus en cours d'execution, et rien n'avait encore exerce ce chemin
+# de code precis -- la bascule de leader n'avait jusque-la ete verifiee qu'a
+# la main (kill -SIGINT sur un pid trouve via pgrep), ce que ce test fait
+# maintenant de facon programmatique.
 #
-# A fully self-contained version of this file (launching run_swarm.sh
-# itself, so a single command needs no separately-running precondition)
-# was also attempted while investigating this and reverted -- worth
-# recording why:
-#   1. A launch.actions.TimerAction delaying the 3 swarm_node Node actions
-#      until PX4 had time to boot made the AttributeError above *look*
-#      TimerAction-specific (it wasn't -- see above).
-#   2. Removing that delay (racing swarm_node's start against
-#      run_swarm.sh, relying on a bumped 90s MAVSDK connection wait -- see
-#      connect_and_fly() in swarm_node.cpp -- to outlast a cold boot)
-#      surfaced a real, independent bug: run_swarm.sh's own hardcoded 15s
-#      stagger between drone_0 and drone_1/2 wasn't enough for Gazebo to
-#      become ready under the *extra* concurrent load of 3 ROS 2 processes
-#      also starting up, and drone_1/2's PX4 instances died with "Timed
-#      out waiting for Gazebo world". Fixed by widening that stagger to
-#      25s (a real, kept fix -- see run_swarm.sh).
-#   3. With that fixed, 2 of 3 drones still silently stalled -- no
-#      progress logged at all past the initial election message, neither
-#      reaching Offboard nor timing out with an error. Not root-caused in
-#      the time available.
-# Net effect: two real, unrelated bugs found and fixed either way (kept),
-# but full one-command automation isn't reliable yet -- shipping the
-# flakier version would be worse than the two-step manual precondition.
+# Une version totalement autonome de ce fichier (lancant run_swarm.sh
+# lui-meme, pour qu'une seule commande suffise sans precondition lancee
+# separement) a aussi ete tentee pendant cette investigation puis
+# abandonnee -- utile de noter pourquoi :
+#   1. Un launch.actions.TimerAction retardant les 3 actions Node de
+#      swarm_node le temps que PX4 demarre faisait *ressembler* l'
+#      AttributeError ci-dessus a un probleme specifique au TimerAction
+#      (ce n'etait pas le cas -- voir ci-dessus).
+#   2. En retirant ce delai (le demarrage de swarm_node entre alors en
+#      course avec run_swarm.sh, en comptant sur une attente de connexion
+#      MAVSDK allongee a 90s -- voir connect_and_fly() dans swarm_node.cpp
+#      -- pour survivre a un demarrage a froid), un vrai bug independant
+#      est apparu : le decalage fixe de 15s de run_swarm.sh entre drone_0
+#      et drone_1/2 n'etait pas suffisant pour que Gazebo soit pret sous
+#      la charge concurrente *supplementaire* de 3 processus ROS2 qui
+#      demarrent aussi, et les instances PX4 de drone_1/2 mouraient avec
+#      "Timed out waiting for Gazebo world". Corrige en elargissant ce
+#      decalage a 25s (un vrai correctif, conserve -- voir run_swarm.sh).
+#   3. Une fois ce point corrige, 2 des 3 drones restaient quand meme
+#      bloques silencieusement -- aucune progression loguee au-dela du
+#      message d'election initial, ni passage en Offboard ni timeout avec
+#      erreur. Cause racine non identifiee dans le temps disponible.
+# Bilan : deux vrais bugs independants trouves et corriges dans les deux
+# cas (conserves), mais l'automatisation complete en une commande n'est
+# pas encore fiable -- livrer la version plus instable serait pire que la
+# precondition manuelle en deux etapes.
 
 import subprocess
 import unittest
@@ -55,6 +61,12 @@ import pytest
 
 @pytest.mark.launch_test
 def generate_test_description():
+    """Decrit le lancement des 3 noeuds swarm_node (drone_0/1/2) pour le test.
+
+    Suppose que run_swarm.sh (PX4 SITL + Gazebo) tourne deja separement --
+    voir la precondition dans le commentaire de module. Retourne le tuple
+    (LaunchDescription, drones) attendu par launch_testing.
+    """
     drones = {
         f'drone_{i}': launch_ros.actions.Node(
             package='swarm_comm',
@@ -72,10 +84,11 @@ def generate_test_description():
 
 
 def kill_node(drone_name):
-    # launch_ros.actions.Node has no .terminate() -- see module docstring.
-    # This is the same mechanism used manually throughout development
-    # (kill -SIGINT on the pid, found by matching the ROS node-name
-    # argument in the command line).
+    """Tue un noeud swarm_node par SIGINT (simule une deconnexion/panne pour tester la bascule de leader)."""
+    # launch_ros.actions.Node n'a pas de .terminate() -- voir la docstring
+    # de module. C'est le meme mecanisme utilise a la main tout au long du
+    # developpement (kill -SIGINT sur le pid, trouve en filtrant sur
+    # l'argument de nom de noeud ROS dans la ligne de commande).
     subprocess.run(
         ['pkill', '-SIGINT', '-f', f'__node:={drone_name}'],
         check=True,
@@ -84,22 +97,26 @@ def kill_node(drone_name):
 
 class TestSwarmFormation(unittest.TestCase):
     """
-    Real arm/takeoff/Offboard flight against already-running PX4 SITL, so
-    timeouts are generous compared to test_election.py's fake-position
-    version (a real climb-out plus Offboard handshake takes ~10-15s).
+    Vol reel arm/decollage/Offboard contre un PX4 SITL deja en cours
+    d'execution, donc les timeouts sont plus genereux que dans la version
+    a positions fictives de test_election.py (une vraie montee plus la
+    poignee de main Offboard prend environ 10-15s).
     """
 
     def test_1_all_drones_reach_offboard(self, proc_output, drone_0, drone_1, drone_2):
+        """Verifie que les 3 drones decollent bien et passent en mode Offboard."""
         for name, proc in (('drone_0', drone_0), ('drone_1', drone_1), ('drone_2', drone_2)):
             proc_output.assertWaitFor('Airborne, in Offboard', process=proc, timeout=60)
 
     def test_2_leader_failover_in_flight(self, proc_output, drone_0, drone_1, drone_2):
-        # Mirrors the ground-based failover already covered by
-        # test_election.py, but this time the swarm is actually airborne:
-        # confirms the election handoff and the formation control law
-        # (which re-anchors the loiter phase to the new leader's live
-        # position -- see elect_leader() in swarm_node.cpp) both survive
-        # contact with real flight, not just simulated positions.
+        """Tue drone_0 (leader) en plein vol et verifie que drone_1/2 basculent vers un nouveau leader."""
+        # Reproduit la bascule deja couverte au sol par test_election.py,
+        # mais cette fois l'essaim est vraiment en vol : confirme que la
+        # passation d'election et la loi de commande de formation (qui
+        # re-ancre la phase de loiter sur la position reelle du nouveau
+        # leader -- voir elect_leader() dans swarm_node.cpp) survivent
+        # toutes deux au contact d'un vrai vol, pas seulement de positions
+        # simulees.
         kill_node('drone_0')
         for name, proc in (('drone_1', drone_1), ('drone_2', drone_2)):
             proc_output.assertWaitFor('Signal lost with drone_0', process=proc, timeout=8)

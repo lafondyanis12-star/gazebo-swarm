@@ -59,11 +59,17 @@ PARK_NORTH_M = LOITER_CENTER_NORTH_M
 
 
 def lerp(a, b, frac):
+    """Interpolation lineaire entre a et b, frac borne a [0, 1]."""
     frac = max(0.0, min(1.0, frac))
     return a + (b - a) * frac
 
 
 def loiter_pos(t, phase_offset):
+    """Position et vitesse (est/nord) sur le cercle de loiter a l'instant t.
+
+    phase_offset permet de re-ancrer la phase (ex: au changement de leader).
+    Retourne (e, n, ve, vn) : position puis vitesse est/nord.
+    """
     phase = LOITER_OMEGA * t + phase_offset
     e = LOITER_CENTER_EAST_M + LOITER_RADIUS_M * math.cos(phase)
     n = LOITER_CENTER_NORTH_M + LOITER_RADIUS_M * math.sin(phase)
@@ -73,15 +79,19 @@ def loiter_pos(t, phase_offset):
 
 
 def rotate_offset(forward, right, heading):
+    """Convertit un decalage (avant, droite) relatif au cap en decalage est/nord absolu."""
     fwd_e, fwd_n = math.sin(heading), math.cos(heading)
     right_e, right_n = math.cos(heading), -math.sin(heading)
     return fwd_e * forward + right_e * right, fwd_n * forward + right_n * right
 
 
 class FlightSimulator(Node):
+    """Noeud ROS2 qui pilote directement les parametres x/y/z des 3 swarm_node
+    pour simuler un vol (sans PX4/Gazebo) et observer l'election reelle."""
 
     def __init__(self):
         super().__init__('simulate_triangle_flight')
+        # Un client de service SetParameters par drone, pour imposer sa position.
         self.param_clients = {
             i: self.create_client(SetParameters, f'/drone_{i}/set_parameters')
             for i in range(NUM_DRONES)
@@ -92,6 +102,8 @@ class FlightSimulator(Node):
                     f'/drone_{i}/set_parameters indisponible -- '
                     f'lance d\'abord: ros2 launch swarm_comm swarm_launch.py')
 
+        # Etat percu par le "vrai" systeme (rempli par les callbacks d'abonnement
+        # ci-dessous), utilise seulement pour le log/verification -- pas pour piloter.
         self.claimed_leader = {i: -1 for i in range(NUM_DRONES)}
         self.peer_connected = {i: [True] * NUM_DRONES for i in range(NUM_DRONES)}
         for i in range(NUM_DRONES):
@@ -110,12 +122,14 @@ class FlightSimulator(Node):
         self.rejoin_from = None
 
     def _make_cb(self, i):
+        """Cree le callback d'abonnement /swarm_status pour le drone i (capture i)."""
         def cb(msg):
             self.claimed_leader[i] = msg.claimed_leader
             self.peer_connected[i] = list(msg.peer_connected)
         return cb
 
     def set_pos(self, drone_id, x, y, z):
+        """Impose la position (x, y, z) d'un drone via le service set_parameters."""
         self.pos[drone_id] = [x, y, z]
         req = SetParameters.Request()
         for name, val in (('x', x), ('y', y), ('z', z)):
@@ -126,19 +140,30 @@ class FlightSimulator(Node):
         self.param_clients[drone_id].call_async(req)
 
     def formation_slots(self, leader_id):
+        """Calcule les 2 positions laterales (gauche/droite) des suiveurs pour un leader donne."""
         followers = sorted(i for i in range(NUM_DRONES) if i != leader_id)
         # gauche = plus petit id, comme formation_side_is_left() dans swarm_node.cpp
         return {followers[0]: FORMATION_HALF_WIDTH_M, followers[1]: -FORMATION_HALF_WIDTH_M}
 
     def spin(self, seconds):
+        """Traite les callbacks/futures ROS2 en attente pendant `seconds` (0 = non bloquant)."""
         rclpy.spin_once(self, timeout_sec=seconds)
 
 
 def log(msg):
+    """Affiche un message horodate (temps ecoule depuis START)."""
     print(f'[T+{time.monotonic() - START:6.1f}s] {msg}', flush=True)
 
 
 def run():
+    """Boucle principale : machine a etats decollage -> vol -> atterrissage -> fin.
+
+    A chaque tick (TICK_S), calcule la position cible de chaque drone selon
+    la phase courante et l'envoie via set_pos(). C'est ce script qui decide
+    du scenario (deconnexion/reconnexion de drone_0) ; l'election reelle
+    (claimed_leader) n'est lue que pour verifier/logger le comportement du
+    vrai systeme, jamais pour piloter la simulation.
+    """
     global START
     rclpy.init()
     sim = FlightSimulator()

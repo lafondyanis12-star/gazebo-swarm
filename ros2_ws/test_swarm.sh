@@ -5,8 +5,13 @@
 # 3 terminaux ni de taper les ros2 param set soi-meme.
 set -euo pipefail
 
+# Répertoire du script (racine du workspace ROS2), quel que soit l'endroit
+# d'où le script est appelé
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Préfère un ROS2 installé nativement via apt (standard sous Linux) ;
+# sinon se rabat sur un environnement RoboStack/micromamba (utilisé sur
+# macOS, où ROS2 n'a pas de paquet natif).
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
   source /opt/ros/jazzy/setup.bash
 elif [[ -f "$HOME/micromamba/envs/ros_env/setup.bash" ]]; then
@@ -18,7 +23,13 @@ else
 fi
 
 cd "$DIR"
+# Recompile les paquets concernés avant de tester (garantit que les tests
+# tournent sur le code à jour)
 colcon build --packages-select swarm_comm swarm_msgs
+# Charge l'environnement du workspace fraîchement compilé
 source install/setup.bash
+# Lance les tests launch_testing du paquet swarm_comm ; affiche la sortie
+# console des noeuds directement (utile pour déboguer un scénario qui échoue)
 colcon test --packages-select swarm_comm --event-handlers console_direct+
+# Affiche le résumé détaillé des résultats (pass/fail par test)
 colcon test-result --verbose
