@@ -75,10 +75,10 @@
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <swarm_msgs/msg/swarm_status.hpp>
 
-#include <mavsdk/mavsdk.h>
-#include <mavsdk/plugins/action/action.h>
-#include <mavsdk/plugins/offboard/offboard.h>
-#include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/mavsdk.hpp>
+#include <mavsdk/plugins/action/action.hpp>
+#include <mavsdk/plugins/offboard/offboard.hpp>
+#include <mavsdk/plugins/telemetry/telemetry.hpp>
 
 #include <algorithm>
 #include <atomic>
